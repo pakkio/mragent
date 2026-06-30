@@ -244,9 +244,14 @@ class MemoryGraph:
         """BM25 over a virtual document = chunk_text + weighted cues + tags, return top-N."""
         import re
         import math
+        import unicodedata
         import snowballstemmer
 
-        raw_terms = re.sub(r"[^\w\s]", " ", query.lower()).split()
+        def _fold(word: str) -> str:
+            """Strip diacritics via NFKD: schrödinger → schrodinger."""
+            return unicodedata.normalize("NFKD", word).encode("ascii", "ignore").decode()
+
+        raw_terms = re.sub(r"[^\w\s]", " ", _fold(query.lower())).split()
         terms = [t for t in raw_terms if len(t) > 2]
         if not terms:
             return []
@@ -294,7 +299,7 @@ class MemoryGraph:
         N = len(rows)
 
         def tokenize(text: str) -> list[str]:
-            return re.sub(r"[^\w\s]", " ", (text or "").lower()).split()
+            return re.sub(r"[^\w\s]", " ", _fold((text or "").lower())).split()
 
         # build virtual docs: text + cues repeated 5× + tags repeated 3×
         docs: list[tuple[str, list[str]]] = []
