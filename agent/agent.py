@@ -73,7 +73,13 @@ class MemoryAgent:
         """
         docname = alias or os.path.splitext(os.path.basename(path))[0]
 
-        if batch_pages > 0 and engine != "mistral-ocr-4":
+        # Plain-text files: read directly — no OCR needed
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".txt":
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            print(f"[ingest] read {len(text)} chars directly from {os.path.basename(path)}")
+        elif batch_pages > 0 and engine != "mistral-ocr-4":
             text = self._ingest_batched(path, engine, batch_pages, workers)
         elif engine == "mistral-ocr-4":
             text = self.llm.extract_pdf_mistral_ocr4(path)
