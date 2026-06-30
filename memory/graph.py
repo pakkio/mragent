@@ -87,16 +87,71 @@ class MemoryGraph:
         return results
 
     def rank_chunks(self, query: str, top_n: int = 8) -> list[str]:
-        """Score content nodes by term overlap with query, return top-N texts."""
-        terms = set(query.lower().split())
-        scored = []
+        """BM25 over a virtual document = chunk_text + weighted cues + tags, return top-N."""
+        import re
+        import math
+
+        raw_terms = re.sub(r"[^\w\s]", " ", query.lower()).split()
+        terms = [t for t in raw_terms if len(t) > 2]
+        if not terms:
+            return []
+
+        # BM25 parameters
+        k1, b = 1.5, 0.75
+
+        # pre-index: content_id → cue/tag texts
+        cue_map: dict[str, list[str]] = {}
+        tag_map: dict[str, list[str]] = {}
         for node in self.nodes.values():
-            if node.type != "content":
-                continue
-            text_lower = node.text.lower()
-            score = sum(text_lower.count(t) for t in terms if len(t) > 2)
+            if node.type == "cue":
+                for tid in node.edges:
+                    tag = self.nodes.get(tid)
+                    if tag and tag.type == "tag":
+                        for cid in tag.edges:
+                            cue_map.setdefault(cid, []).append(node.text.lower())
+            elif node.type == "tag":
+                for cid in node.edges:
+                    tag_map.setdefault(cid, []).append(node.text.lower())
+
+        # build virtual docs: chunk text + repeated cues (5×) + repeated tags (3×)
+        content_nodes = [n for n in self.nodes.values() if n.type == "content"]
+        N = len(content_nodes)
+        if N == 0:
+            return []
+
+        def tokenize(text: str) -> list[str]:
+            return re.sub(r"[^\w\s]", " ", text.lower()).split()
+
+        docs: list[tuple[str, list[str]]] = []
+        for node in content_nodes:
+            cue_tokens = tokenize(" ".join(cue_map.get(node.id, []))) * 5
+            tag_tokens = tokenize(" ".join(tag_map.get(node.id, []))) * 3
+            tokens = tokenize(node.text) + cue_tokens + tag_tokens
+            docs.append((node.text, tokens))
+
+        avgdl = sum(len(tokens) for _, tokens in docs) / N
+
+        # IDF per query term
+        def idf(term: str) -> float:
+            df = sum(1 for _, tokens in docs if term in tokens)
+            return math.log((N - df + 0.5) / (df + 0.5) + 1)
+
+        idfs = {t: idf(t) for t in terms}
+
+        scored = []
+        for text, tokens in docs:
+            dl = len(tokens)
+            tf_map: dict[str, int] = {}
+            for tok in tokens:
+                tf_map[tok] = tf_map.get(tok, 0) + 1
+            score = sum(
+                idfs[t] * (tf_map.get(t, 0) * (k1 + 1))
+                / (tf_map.get(t, 0) + k1 * (1 - b + b * dl / avgdl))
+                for t in terms
+            )
             if score > 0:
-                scored.append((score, node.text))
+                scored.append((score, text))
+
         scored.sort(reverse=True)
         return [text for _, text in scored[:top_n]]
 

@@ -1,6 +1,7 @@
 import base64
 import os
 import json
+import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
@@ -35,7 +36,7 @@ class LLMWrapper:
         if not self.api_key:
             raise ValueError("OPENROUTER_APIKEY not set in environment or .env")
 
-    def _request(self, payload: dict) -> dict:
+    def _request(self, payload: dict, timeout: int = 120) -> dict:
         req = urllib.request.Request(
             OPENROUTER_API_URL,
             data=json.dumps(payload).encode(),
@@ -44,12 +45,22 @@ class LLMWrapper:
                 "Content-Type": "application/json",
             },
         )
+        model = payload.get("model", "?")
+        plugins = payload.get("plugins")
+        label = f"{model}" + (f" +plugins={[p['id'] for p in plugins]}" if plugins else "")
+        print(f"[openrouter] → {label}", flush=True)
+        t0 = time.time()
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                print(f"[openrouter] ← headers received ({time.time()-t0:.1f}s), reading body...", flush=True)
                 data = json.loads(resp.read())
+                elapsed = time.time() - t0
                 self.last_model = data.get("model", "unknown")
-                print(f"[openrouter] model used: {self.last_model}")
+                usage = data.get("usage", {})
+                print(f"[openrouter] done in {elapsed:.1f}s | model={self.last_model} | tokens={usage}", flush=True)
                 return data
+        except TimeoutError:
+            raise RuntimeError(f"OpenRouter timed out after {timeout}s — try --engine mistral-ocr-4 or split the PDF")
         except urllib.error.HTTPError as e:
             body = e.read().decode()
             raise RuntimeError(f"OpenRouter error {e.code}: {body}") from e
@@ -74,8 +85,11 @@ class LLMWrapper:
 
     def extract_pdf_openrouter(self, path: str, engine: str = "mistral-ocr") -> str:
         """Send a PDF through OpenRouter's file-parser plugin and return extracted text."""
+        size_mb = os.path.getsize(path) / 1_048_576
+        print(f"[ocr] reading {os.path.basename(path)} ({size_mb:.1f} MB), engine={engine}", flush=True)
         with open(path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
+        print(f"[ocr] base64 encoded ({len(b64)//1024} KB), uploading to OpenRouter...", flush=True)
         payload = {
             "model": self.model,
             "plugins": [{"id": "file-parser", "pdf": {"engine": engine}}],
@@ -100,8 +114,10 @@ class LLMWrapper:
                 ],
             }],
         }
-        data = self._request(payload)
-        return data["choices"][0]["message"]["content"]
+        data = self._request(payload, timeout=300)
+        text = data["choices"][0]["message"]["content"]
+        print(f"[ocr] extracted {len(text)} chars", flush=True)
+        return text
 
     def extract_pdf_mistral_ocr4(self, path: str) -> str:
         """Call Mistral OCR 4 directly (requires MISTRAL_API_KEY). Returns markdown."""
