@@ -2,17 +2,29 @@
 """mragent — multi-role LLM agent with graph memory."""
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
 from llmwrapper import LLMWrapper, Prompt
 from memory.graph import MemoryGraph
 from agent.agent import MemoryAgent
 
-MEMORY_FILE = "memory.json"
+CONFIG = {}
+
+
+def _load_config() -> dict:
+    global CONFIG
+    config_path = Path(__file__).parent / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            CONFIG = json.load(f)
+    return CONFIG
 
 
 def _agent(llm: LLMWrapper) -> MemoryAgent:
-    return MemoryAgent(llm, MemoryGraph(MEMORY_FILE))
+    db_path = CONFIG.get("db_path", "memory.db")
+    return MemoryAgent(llm, MemoryGraph(db_path))
 
 
 # ── commands ──────────────────────────────────────────────────────────────────
@@ -114,24 +126,83 @@ def cmd_recall(llm: LLMWrapper, args) -> None:
 def cmd_ingest(llm: LLMWrapper, args) -> None:
     """Ingest a PDF into the memory graph."""
     agent = _agent(llm)
-    count = agent.ingest_pdf(args.file, engine=args.engine, chunk_size=args.chunk_size, workers=args.workers)
-    print(f"[ingest] done — {count} chunk(s) stored from {args.file}")
+    count = agent.ingest_pdf(
+        args.file, engine=args.engine,
+        chunk_size=args.chunk_size, workers=args.workers,
+        alias=args.alias,
+    )
+    alias = args.alias or args.file
+    print(f"[ingest] done — {count} chunk(s) stored as '{alias}'")
 
 
-def cmd_memory_show(_llm: LLMWrapper, _args) -> None:
+def cmd_forget(llm: LLMWrapper, args) -> None:
+    """Forget a document or a single chunk by id."""
+    agent = _agent(llm)
+    if args.id:
+        try:
+            nid = int(args.id.lstrip("c"))
+        except ValueError:
+            print(f"[forget] invalid id: {args.id}")
+            return
+        ok = agent.graph.forget_content(nid)
+        if ok:
+            print(f"[forget] removed chunk {args.id}")
+        else:
+            print(f"[forget] chunk {args.id} not found")
+    elif args.doc:
+        agent.graph.forget_doc(args.doc)
+    else:
+        print("[forget] specify --doc <name> or --id <chunk-id>")
+
+
+def cmd_memory_show(_llm: LLMWrapper, args) -> None:
     """Print a summary of what is stored in memory."""
-    graph = MemoryGraph(MEMORY_FILE)
+    db_path = CONFIG.get("db_path", "memory.db")
+    graph = MemoryGraph(db_path)
     cues = graph.all_cues()
     tags = graph.all_tags()
-    content_nodes = [n for n in graph.nodes.values() if n.type == "content"]
+    content_nodes = graph.content_nodes()
+    docs = graph.list_docs()
+
     print(f"Memory: {len(content_nodes)} item(s), {len(cues)} cue(s), {len(tags)} tag(s)")
+
+    if docs:
+        print(f"\nDocuments ({len(docs)}):")
+        for d in docs:
+            print(f"  {d['docname']:30s} {d['chunks']:>4d} chunks  ({d['total_chars']:,} chars)")
+
+    # filter by doc if requested
+    if args.doc:
+        content_nodes = [n for n in content_nodes if n.get("docname") == args.doc]
+        if not content_nodes:
+            print(f"\nNo chunks for doc '{args.doc}'")
+            return
+        print(f"\nChunks in '{args.doc}':")
+
     if tags:
-        print(f"Tags : {', '.join(tags)}")
+        print(f"\nTags : {', '.join(tags)}")
     if cues:
         print(f"Cues : {', '.join(cues)}")
+
     for node in content_nodes:
-        preview = node.text[:120].replace("\n", " ")
-        print(f"  [{node.id}] {preview}{'...' if len(node.text) > 120 else ''}")
+        preview = node["text"][:120].replace("\n", " ")
+        dn = f" [{node.get('docname')}]" if node.get("docname") else ""
+        print(f"  [{node['id']}]{dn} {preview}{'...' if len(node['text']) > 120 else ''}")
+
+
+def cmd_docs(_llm: LLMWrapper, _args) -> None:
+    """List ingested documents."""
+    db_path = CONFIG.get("db_path", "memory.db")
+    graph = MemoryGraph(db_path)
+    docs = graph.list_docs()
+    if not docs:
+        print("No documents ingested yet.")
+        return
+    print(f"{'Document':30s} {'Chunks':>6s}  {'Size':>10s}")
+    print("-" * 50)
+    for d in docs:
+        kb = d["total_chars"] / 1024
+        print(f"{d['docname']:30s} {d['chunks']:>6d}  {kb:>7.1f} KB")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -172,12 +243,24 @@ def main():
         choices=["mistral-ocr", "cloudflare-ai", "native", "mistral-ocr-4"],
         help="OCR engine (default: mistral-ocr via OpenRouter at $2/1000 pages)",
     )
-    p_ing.add_argument("--chunk-size", type=int, default=800, metavar="N",
+    p_ing.add_argument("--chunk-size", type=int, default=_load_config().get("chunk_size", 800), metavar="N",
                        help="Max chars per memory chunk (default: 800)")
-    p_ing.add_argument("--workers", type=int, default=5, metavar="N",
+    p_ing.add_argument("--workers", type=int, default=_load_config().get("workers", 5), metavar="N",
                        help="Parallel LLM workers for cue/tag extraction (default: 5)")
+    p_ing.add_argument("--alias", default=None, metavar="NAME",
+                       help="Docname for all stored chunks (default: filename)")
 
-    sub.add_parser("memory", help="Show memory graph summary")
+    p_for = sub.add_parser("forget", help="Forget a document or a single chunk")
+    p_for.add_argument("--doc", default=None, metavar="NAME",
+                       help="Forget all chunks belonging to this document")
+    p_for.add_argument("--id", default=None, metavar="ID",
+                       help="Forget a single chunk by id (e.g. c5)")
+
+    sub.add_parser("docs", help="List ingested documents")
+
+    p_mem = sub.add_parser("memory", help="Show memory graph summary")
+    p_mem.add_argument("--doc", default=None, metavar="NAME",
+                       help="Show only chunks for this document")
 
     args = parser.parse_args()
     llm = LLMWrapper(model=args.model) if args.model else LLMWrapper()
@@ -190,6 +273,8 @@ def main():
         "remember": cmd_remember,
         "recall": cmd_recall,
         "ingest": cmd_ingest,
+        "docs": cmd_docs,
+        "forget": cmd_forget,
         "memory": cmd_memory_show,
     }
     dispatch[args.command](llm, args)

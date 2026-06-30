@@ -5,13 +5,25 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+
+
+def _load_config() -> dict:
+    config_path = Path(__file__).parent / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            return json.load(f)
+    return {}
+
+
+_config = _load_config()
+DEFAULT_MODEL = _config.get("model", "deepseek/deepseek-v4-flash")
 
 
 @dataclass
@@ -48,11 +60,11 @@ class LLMWrapper:
         model = payload.get("model", "?")
         plugins = payload.get("plugins")
         label = f"{model}" + (f" +plugins={[p['id'] for p in plugins]}" if plugins else "")
-        print(f"[openrouter] → {label}", flush=True)
+        print(f"[openrouter] -> {label}", flush=True)
         t0 = time.time()
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                print(f"[openrouter] ← headers received ({time.time()-t0:.1f}s), reading body...", flush=True)
+                print(f"[openrouter] <- headers received ({time.time()-t0:.1f}s), reading body...", flush=True)
                 data = json.loads(resp.read())
                 elapsed = time.time() - t0
                 self.last_model = data.get("model", "unknown")

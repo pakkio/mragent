@@ -1,0 +1,7 @@
+{
+  "model": "deepseek/deepseek-v4-flash",
+  "db_path": "memory.db",
+  "chunk_size": 800,
+  "workers": 5,
+  "max_recall_items": 8
+}

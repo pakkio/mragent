@@ -30,13 +30,17 @@ class MemoryAgent:
         self.graph = graph
         self.max_steps = max_steps
 
-    def store(self, content: str, cues: list[str], tags: list[str]) -> str:
+    def store(
+        self, content: str, cues: list[str], tags: list[str],
+        docname: str | None = None,
+    ) -> str:
         """Store content with manually specified cues and tags."""
-        cid = self.graph.add_memory(content, cues, tags)
-        print(f"[memory] stored {cid} | cues={cues} | tags={tags}")
+        cid = self.graph.add_memory(content, cues, tags, docname=docname)
+        label = f" [{docname}]" if docname else ""
+        print(f"[memory] stored {cid}{label} | cues={cues} | tags={tags}")
         return cid
 
-    def store_auto(self, content: str) -> str:
+    def store_auto(self, content: str, docname: str | None = None) -> str:
         """Use LLM to extract cues/tags, then store."""
         raw = self.llm.call(Prompt(
             user=f"Text to index:\n\n{content}",
@@ -50,14 +54,24 @@ class MemoryAgent:
             words = content.split()
             cues = words[:4]
             tags = ["general"]
-        return self.store(content, cues, tags)
+        return self.store(content, cues, tags, docname=docname)
 
-    def ingest_pdf(self, path: str, engine: str = "mistral-ocr", chunk_size: int = 800, workers: int = 5) -> int:
-        """Extract text from a PDF, chunk it, and store each chunk in memory."""
+    def ingest_pdf(
+        self, path: str, engine: str = "mistral-ocr",
+        chunk_size: int = 800, workers: int = 5,
+        alias: str | None = None,
+    ) -> int:
+        """Extract text from a PDF, chunk it, and store each chunk in memory.
+
+        If *alias* is given it becomes the docname for all chunks;
+        otherwise the filename (without extension) is used.
+        """
         if engine == "mistral-ocr-4":
             text = self.llm.extract_pdf_mistral_ocr4(path)
         else:
             text = self.llm.extract_pdf_openrouter(path, engine=engine)
+
+        docname = alias or os.path.splitext(os.path.basename(path))[0]
 
         # Split on blank lines, merge small fragments up to chunk_size
         paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 40]
@@ -73,13 +87,13 @@ class MemoryAgent:
         if current:
             chunks.append(current)
 
-        print(f"[ingest] {len(chunks)} chunk(s) from {os.path.basename(path)} — {workers} workers")
+        print(f"[ingest] {len(chunks)} chunk(s) from {os.path.basename(path)} -> '{docname}' — {workers} workers")
 
         done = [0]
 
         def process(item):
             i, chunk = item
-            self.store_auto(chunk)
+            self.store_auto(chunk, docname=docname)
             done[0] += 1
             print(f"  [{done[0]}/{len(chunks)}] {chunk[:70].replace(chr(10), ' ')}...")
 
