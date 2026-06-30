@@ -60,18 +60,25 @@ class MemoryAgent:
         self, path: str, engine: str = "mistral-ocr",
         chunk_size: int = 800, workers: int = 5,
         alias: str | None = None,
+        batch_pages: int = 0,
     ) -> int:
         """Extract text from a PDF, chunk it, and store each chunk in memory.
 
         If *alias* is given it becomes the docname for all chunks;
         otherwise the filename (without extension) is used.
+
+        When *batch_pages* > 0 the PDF is split into sub-PDFs of that many
+        pages and OCR runs in parallel across them — much faster for long
+        documents. Requires ``pypdf`` (``pip install pypdf``).
         """
-        if engine == "mistral-ocr-4":
+        docname = alias or os.path.splitext(os.path.basename(path))[0]
+
+        if batch_pages > 0 and engine != "mistral-ocr-4":
+            text = self._ingest_batched(path, engine, batch_pages, workers)
+        elif engine == "mistral-ocr-4":
             text = self.llm.extract_pdf_mistral_ocr4(path)
         else:
             text = self.llm.extract_pdf_openrouter(path, engine=engine)
-
-        docname = alias or os.path.splitext(os.path.basename(path))[0]
 
         # Split on blank lines, merge small fragments up to chunk_size
         paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 40]
@@ -103,6 +110,75 @@ class MemoryAgent:
                 f.result()  # re-raise any exception
 
         return len(chunks)
+
+    # ── batched PDF ingestion ────────────────────────────────────────────────
+
+    def _ingest_batched(
+        self, path: str, engine: str, batch_pages: int, workers: int,
+    ) -> str:
+        """Split PDF into page batches, OCR each in parallel, return merged text."""
+        import tempfile
+
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except ImportError:
+            raise ImportError(
+                "--batch-pages requires pypdf. Install it: pip install pypdf"
+            )
+
+        reader = PdfReader(path)
+        total = len(reader.pages)
+        batches: list[tuple[int, int, str]] = []  # (start, end, temp_path)
+
+        tmpdir = tempfile.mkdtemp(prefix="mragent_pdf_")
+        try:
+            # split into page-range batches
+            for start in range(0, total, batch_pages):
+                end = min(start + batch_pages, total)
+                writer = PdfWriter()
+                for i in range(start, end):
+                    writer.add_page(reader.pages[i])
+                tmp_path = os.path.join(tmpdir, f"batch_{start:04d}_{end:04d}.pdf")
+                with open(tmp_path, "wb") as f:
+                    writer.write(f)
+                batches.append((start + 1, end, tmp_path))
+
+            print(f"[ingest] {total} page(s) split into {len(batches)} batch(es) "
+                  f"({batch_pages} pages each) — {min(workers, len(batches))} parallel OCR workers")
+
+            # OCR each batch in parallel
+            results: dict[int, str] = {}
+
+            def ocr_batch(item):
+                idx, (pg_start, pg_end, tmp_path) = item
+                t0 = time.time()
+                size_kb = os.path.getsize(tmp_path) / 1024
+                print(f"  [batch {idx}/{len(batches)}] pages {pg_start}-{pg_end} "
+                      f"({size_kb:.0f} KB) OCR...", flush=True)
+                txt = self.llm.extract_pdf_openrouter(tmp_path, engine=engine)
+                elapsed = time.time() - t0
+                print(f"  [batch {idx}/{len(batches)}] pages {pg_start}-{pg_end} "
+                      f"done in {elapsed:.1f}s ({len(txt)} chars)", flush=True)
+                return idx, txt
+
+            with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as pool:
+                futures = [
+                    pool.submit(ocr_batch, (i, b))
+                    for i, b in enumerate(batches, 1)
+                ]
+                for f in as_completed(futures):
+                    idx, txt = f.result()
+                    results[idx] = txt
+
+            # merge in order
+            merged = "\n\n".join(results[i] for i in sorted(results))
+            print(f"[ingest] merged {len(merged)} chars from {len(batches)} batch(es)")
+            return merged
+
+        finally:
+            # clean up temp files
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def recall_fast(self, query: str, top_n: int = 8) -> str:
         """Single-shot: rank chunks locally, synthesize in one LLM call."""

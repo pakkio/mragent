@@ -244,11 +244,27 @@ class MemoryGraph:
         """BM25 over a virtual document = chunk_text + weighted cues + tags, return top-N."""
         import re
         import math
+        import snowballstemmer
 
         raw_terms = re.sub(r"[^\w\s]", " ", query.lower()).split()
         terms = [t for t in raw_terms if len(t) > 2]
         if not terms:
             return []
+
+        # Snowball stemmers — Italian handles verb/noun variation (consumato ↔ consumo);
+        # English as fallback so non-Italian tokens pass through.
+        _stem_it = snowballstemmer.stemmer("italian")
+        _stem_en = snowballstemmer.stemmer("english")
+
+        def _stem(word: str) -> str:
+            """Stem a word: Italian first, fall back to English."""
+            s = _stem_it.stemWord(word)
+            if s != word.lower():
+                return s
+            return _stem_en.stemWord(word)
+
+        # Expand query terms with their stems
+        stem_terms = [_stem(t) for t in terms]
 
         k1, b = 1.5, 0.75
 
@@ -286,6 +302,8 @@ class MemoryGraph:
             tokens = tokenize(text)
             tokens += tokenize(cue_texts or "") * 5
             tokens += tokenize(tag_texts or "") * 3
+            # append stems of every token so morphological variants match
+            tokens += [_stem(tok) for tok in tokens]
             docs.append((text, tokens))
 
         avgdl = sum(len(tokens) for _, tokens in docs) / N
@@ -294,7 +312,7 @@ class MemoryGraph:
             df = sum(1 for _, tokens in docs if term in tokens)
             return math.log((N - df + 0.5) / (df + 0.5) + 1)
 
-        idfs = {t: idf(t) for t in terms}
+        idfs = {t: idf(t) for t in stem_terms}
 
         scored = []
         for text, tokens in docs:
@@ -305,7 +323,7 @@ class MemoryGraph:
             score = sum(
                 idfs[t] * (tf_map.get(t, 0) * (k1 + 1))
                 / (tf_map.get(t, 0) + k1 * (1 - b + b * dl / avgdl))
-                for t in terms
+                for t in stem_terms
             )
             if score > 0:
                 scored.append((score, text))

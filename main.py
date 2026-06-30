@@ -130,6 +130,7 @@ def cmd_ingest(llm: LLMWrapper, args) -> None:
         args.file, engine=args.engine,
         chunk_size=args.chunk_size, workers=args.workers,
         alias=args.alias,
+        batch_pages=args.batch_pages,
     )
     alias = args.alias or args.file
     print(f"[ingest] done — {count} chunk(s) stored as '{alias}'")
@@ -249,6 +250,8 @@ def main():
                        help="Parallel LLM workers for cue/tag extraction (default: 5)")
     p_ing.add_argument("--alias", default=None, metavar="NAME",
                        help="Docname for all stored chunks (default: filename)")
+    p_ing.add_argument("--batch-pages", type=int, default=0, metavar="N",
+                       help="Split PDF into N-page batches for parallel OCR (requires pypdf)")
 
     p_for = sub.add_parser("forget", help="Forget a document or a single chunk")
     p_for.add_argument("--doc", default=None, metavar="NAME",
