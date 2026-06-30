@@ -1,0 +1,26 @@
+[project]
+name = "mragent"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Claudio Pacchiega",email = "claudio.pacchiega@valuepartners.com"}
+]
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv (>=1.2.2,<2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.1.1,<10.0.0)"
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: calls the real OpenRouter API (requires OPENROUTER_APIKEY)",
+]
