@@ -130,14 +130,16 @@ class MemoryGraph:
 
             self._conn.commit()
 
-            # populate content_fts for BM25 retrieval
-            self._fts_upsert(cid)
+        # NB: outside the lock — _fts_upsert re-acquires self._lock and
+        # threading.Lock is not reentrant (deadlock otherwise).
+        # populate content_fts for BM25 retrieval
+        self._fts_upsert(cid)
 
-            # add to FAISS index if embedding was provided
-            if embedding is not None:
-                self._faiss_add_vector(cid, embedding)
+        # add to FAISS index if embedding was provided
+        if embedding is not None:
+            self._faiss_add_vector(cid, embedding)
 
-            return f"c{cid}"
+        return f"c{cid}"
 
     # ── forget ───────────────────────────────────────────────────────────────
 
