@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from llmwrapper import LLMWrapper, Prompt
+from llmwrapper import RERANK_MODEL, RERANK_3_MODEL
 from memory.graph import MemoryGraph
 from memory.controller import TOOLS, dispatch
 
@@ -24,6 +25,16 @@ Format: {"cues": ["keyword1", ...], "tags": ["topic1", ...]}
 cues: 3-6 specific keywords/entities. tags: 2-3 broad topic categories."""
 
 
+def _rrf(ranked_a: list[str], ranked_b: list[str], k: int = 60) -> list[str]:
+    """Reciprocal Rank Fusion: merge two ranked lists into one."""
+    scores: dict[str, float] = {}
+    for rank, chunk in enumerate(ranked_a):
+        scores[chunk] = scores.get(chunk, 0.0) + 1.0 / (k + rank + 1)
+    for rank, chunk in enumerate(ranked_b):
+        scores[chunk] = scores.get(chunk, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores, key=scores.get, reverse=True)
+
+
 class MemoryAgent:
     def __init__(self, llm: LLMWrapper, graph: MemoryGraph, max_steps: int = 3):
         self.llm = llm
@@ -33,34 +44,97 @@ class MemoryAgent:
     def store(
         self, content: str, cues: list[str], tags: list[str],
         docname: str | None = None,
+        embed: bool = True,
     ) -> str:
         """Store content with manually specified cues and tags."""
-        cid = self.graph.add_memory(content, cues, tags, docname=docname)
+        embedding_blob: bytes | None = None
+        if embed:
+            try:
+                vec = self.llm.embed_text(content)
+                import struct
+                embedding_blob = struct.pack(f"{len(vec)}f", *vec)
+            except Exception as e:
+                print(f"[memory] embedding failed: {e}", flush=True)
+        cid = self.graph.add_memory(content, cues, tags, docname=docname, embedding=embedding_blob)
         label = f" [{docname}]" if docname else ""
-        print(f"[memory] stored {cid}{label} | cues={cues} | tags={tags}")
+        emb_status = " +embed" if embedding_blob else ""
+        print(f"[memory] stored {cid}{label}{emb_status} | cues={cues} | tags={tags}")
         return cid
 
-    def store_auto(self, content: str, docname: str | None = None) -> str:
-        """Use LLM to extract cues/tags, then store."""
-        raw = self.llm.call(Prompt(
-            user=f"Text to index:\n\n{content}",
-            system=_EXTRACT_SYSTEM,
-        ))
+    def store_auto(self, content: str, docname: str | None = None, embed: bool = True) -> str:
+        """Use LLM to extract cues/tags, then store.
+        Falls back to first-4-words heuristic if the LLM call or JSON parse fails."""
         try:
+            raw = self.llm.call(Prompt(
+                user=f"Text to index:\n\n{content}",
+                system=_EXTRACT_SYSTEM,
+            ))
             meta = json.loads(raw.strip().lstrip("```json").rstrip("```").strip())
             cues = meta.get("cues", [])
             tags = meta.get("tags", [])
-        except Exception:
+        except Exception as e:
+            print(f"[memory] LLM extraction failed: {e} — using fallback cues", flush=True)
             words = content.split()
             cues = words[:4]
             tags = ["general"]
-        return self.store(content, cues, tags, docname=docname)
+        return self.store(content, cues, tags, docname=docname, embed=embed)
+
+    def embed_existing(self, workers: int = 5) -> int:
+        """Compute & store embeddings for all chunks that don't have one yet."""
+        missing = self.graph.chunks_without_embedding()
+        if not missing:
+            print("[embed] all chunks already have embeddings")
+            return 0
+
+        print(f"[embed] {len(missing)} chunk(s) need embeddings — {workers} workers")
+
+        # Fetch all texts at once
+        import struct
+        with self.graph._lock:
+            rows = {
+                f"c{r[0]}": r[1]
+                for r in self.graph._conn.execute(
+                    f"SELECT id, text FROM nodes WHERE id IN ({','.join('?' * len(missing))})",
+                    [int(c.lstrip('c')) for c in missing],
+                ).fetchall()
+            }
+
+        # Batch embed
+        ordered_ids = missing
+        texts = [rows[cid] for cid in ordered_ids if cid in rows]
+        if not texts:
+            return 0
+
+        vectors = self.llm.embed_batch(texts)
+
+        # Store
+        count = 0
+        for cid, vec in zip(ordered_ids, vectors):
+            blob = struct.pack(f"{len(vec)}f", *vec)
+            nid = int(cid.lstrip("c"))
+            with self.graph._lock:
+                self.graph._conn.execute(
+                    "UPDATE nodes SET embedding = ? WHERE id = ?", (blob, nid)
+                )
+                self.graph._conn.commit()
+            count += 1
+
+        print(f"[embed] stored {count} embedding(s)")
+
+        # Rebuild FAISS index to include the new embeddings
+        if hasattr(self.graph, '_faiss_index'):
+            self.graph._build_faiss()
+
+        return count
 
     def ingest_pdf(
         self, path: str, engine: str = "mistral-ocr",
         chunk_size: int = 800, workers: int = 5,
         alias: str | None = None,
         batch_pages: int = 0,
+        start_chunk: int = 1,
+        resume: bool = False,
+        embed: bool = True,
     ) -> int:
         """Extract text from a PDF, chunk it, and store each chunk in memory.
 
@@ -70,8 +144,25 @@ class MemoryAgent:
         When *batch_pages* > 0 the PDF is split into sub-PDFs of that many
         pages and OCR runs in parallel across them — much faster for long
         documents. Requires ``pypdf`` (``pip install pypdf``).
+
+        *start_chunk* (1-indexed): skip the first N-1 chunks and only store
+        from chunk N onward. Useful for resuming an interrupted ingestion.
+
+        *resume*: auto-detect how many chunks already exist for *docname* and
+        continue from the next one. Overrides *start_chunk* if chunks are found.
         """
         docname = alias or os.path.splitext(os.path.basename(path))[0]
+
+        # ── resolve start index ─────────────────────────────────────────────
+        if resume:
+            existing = self.graph.chunk_count(docname)
+            if existing > 0:
+                start_chunk = existing + 1
+                print(f"[ingest] resuming '{docname}': {existing} chunk(s) already stored, starting at {start_chunk}")
+            else:
+                print(f"[ingest] --resume set but no existing chunks for '{docname}' — starting fresh")
+        elif start_chunk > 1:
+            print(f"[ingest] starting at chunk {start_chunk} for '{docname}'")
 
         # Plain-text files: read directly — no OCR needed
         ext = os.path.splitext(path)[1].lower()
@@ -100,18 +191,26 @@ class MemoryAgent:
         if current:
             chunks.append(current)
 
-        print(f"[ingest] {len(chunks)} chunk(s) from {os.path.basename(path)} -> '{docname}' — {workers} workers")
+        total = len(chunks)
+        if start_chunk > total:
+            print(f"[ingest] start_chunk={start_chunk} > total chunks={total} — nothing to do")
+            return 0
+        chunks = chunks[start_chunk - 1:]
+
+        print(f"[ingest] {total} total chunk(s) from {os.path.basename(path)} -> '{docname}'; "
+              f"storing {len(chunks)} chunk(s) (chunk {start_chunk}–{total}) — {workers} workers")
 
         done = [0]
 
         def process(item):
             i, chunk = item
-            self.store_auto(chunk, docname=docname)
+            self.store_auto(chunk, docname=docname, embed=embed)
             done[0] += 1
-            print(f"  [{done[0]}/{len(chunks)}] {chunk[:70].replace(chr(10), ' ')}...")
+            label = f"  [{start_chunk + done[0] - 1}/{total}]" if start_chunk > 1 else f"  [{done[0]}/{total}]"
+            print(f"{label} {chunk[:70].replace(chr(10), ' ')}...")
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(process, (i, c)) for i, c in enumerate(chunks, 1)]
+            futures = [pool.submit(process, (i, c)) for i, c in enumerate(chunks, start_chunk)]
             for f in as_completed(futures):
                 f.result()  # re-raise any exception
 
@@ -186,26 +285,67 @@ class MemoryAgent:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def recall_fast(self, query: str, top_n: int = 8) -> str:
-        """Single-shot: rank chunks locally, synthesize in one LLM call."""
+    def recall_fast(self, query: str, top_n: int = 32, rerank: bool = True) -> str:
+        """Hybrid: query expansion → BM25 + embedding → reciprocal rank fusion → LLM re-rank → synthesize."""
         t0 = time.time()
-        chunks = self.graph.rank_chunks(query, top_n=top_n)
+
+        # Step 1 — query expansion via graph cues
+        expanded = self.graph.expand_query(query)
+        if expanded != query:
+            print(f"  [fast] query expanded: {query!r} → {expanded!r}", flush=True)
+
+        # Step 2 — dual retrieval: BM25 + embedding
+        fetch_n = top_n * 2 if rerank else top_n
+        bm25_chunks = self.graph.rank_chunks(expanded, top_n=fetch_n)
+
+        embed_chunks: list[str] = []
+        try:
+            q_vec = self.llm.embed_text(query)
+            embed_chunks = self.graph.rank_by_embedding(q_vec, top_n=fetch_n)
+            print(f"  [fast] BM25={len(bm25_chunks)} + embed={len(embed_chunks)} chunks", flush=True)
+        except Exception as e:
+            print(f"  [fast] embedding retrieval failed: {e} — using BM25 only", flush=True)
+
+        # Step 3 — reciprocal rank fusion
+        if embed_chunks:
+            chunks = _rrf(bm25_chunks, embed_chunks, k=60)
+        else:
+            chunks = bm25_chunks
+        chunks = chunks[:fetch_n]  # trim to same budget
+
         if not chunks:
             return "Nothing relevant found in memory."
+
+        # Step 4 — LLM re-ranking (optional)
+        if rerank and len(chunks) > top_n:
+            print(f"  [fast] re-ranking {len(chunks)} → {top_n} chunks via LLM...", flush=True)
+            chunks = self._rerank(query, chunks, top_k=top_n)
+            print(f"  [fast] re-ranked to {len(chunks)} chunks", flush=True)
+
+        # Step 5 — synthesize answer
         context = "\n\n---\n\n".join(chunks)
-        print(f"  [fast] {len(chunks)} chunk(s) ranked locally, calling LLM...", flush=True)
+        print(f"  [fast] {len(chunks)} chunk(s), calling LLM...", flush=True)
         answer = self.llm.call(Prompt(
             user=f"Question: {query}\n\nRelevant memory:\n\n{context}",
-            system="Answer the question using ONLY the provided memory. Be thorough and well-structured.",
+            system=(
+                "Answer the question using ONLY the provided memory. "
+                "Be thorough and well-structured. When the memory contains equations, "
+                "include them explicitly — do not just describe them."
+            ),
         ))
         print(f"  [fast] done in {time.time() - t0:.1f}s total", flush=True)
         return answer
 
-    def recall(self, query: str, deep: bool = False) -> str:
+    def _rerank(self, query: str, chunks: list[str], top_k: int,
+                 model: str = RERANK_3_MODEL) -> list[str]:
+        """Use Cohere Rerank to re-rank *chunks* by relevance to *query*."""
+        return self.llm.rerank(query, chunks, top_n=top_k, model=model)
+
+    def recall(self, query: str, deep: bool = False, top_n: int | None = None, rerank: bool = True) -> str:
         """Recall from memory. Fast mode (default): local ranking + single LLM call.
         Deep mode: iterative LLM-guided graph traversal."""
         if not deep:
-            return self.recall_fast(query)
+            return self.recall_fast(query, top_n=top_n or 32, rerank=rerank)
         return self.recall_deep(query)
 
     def recall_deep(self, query: str) -> str:

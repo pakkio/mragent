@@ -6,3 +6,6 @@ memory.db
 *.egg-info/
 dist/
 .venv/
+memory.faiss
+memory.faiss.ids.npy
+*.txt

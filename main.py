@@ -119,7 +119,7 @@ def cmd_recall(llm: LLMWrapper, args) -> None:
     query = " ".join(args.query)
     print(f"[recall] {query}\n")
     agent = _agent(llm)
-    answer = agent.recall(query, deep=args.deep)
+    answer = agent.recall(query, deep=args.deep, top_n=args.top_n, rerank=not args.no_rerank)
     print(f"\n{answer}")
 
 
@@ -131,9 +131,18 @@ def cmd_ingest(llm: LLMWrapper, args) -> None:
         chunk_size=args.chunk_size, workers=args.workers,
         alias=args.alias,
         batch_pages=args.batch_pages,
+        start_chunk=args.start_chunk,
+        resume=args.resume,
+        embed=not args.no_embed,
     )
     alias = args.alias or args.file
     print(f"[ingest] done — {count} chunk(s) stored as '{alias}'")
+
+
+def cmd_embed_chunks(llm: LLMWrapper, args) -> None:
+    """(Re)compute embeddings for all chunks that lack them."""
+    agent = _agent(llm)
+    agent.embed_existing(workers=args.workers)
 
 
 def cmd_forget(llm: LLMWrapper, args) -> None:
@@ -235,6 +244,10 @@ def main():
     p_rec.add_argument("query", nargs="+")
     p_rec.add_argument("--deep", action="store_true",
                        help="Iterative LLM-guided graph traversal (slower, more thorough)")
+    p_rec.add_argument("--top-n", type=int, default=None, metavar="N",
+                       help="Number of chunks for fast recall (default: 32)")
+    p_rec.add_argument("--no-rerank", action="store_true",
+                       help="Skip LLM re-ranking step (faster, less precise)")
 
     p_ing = sub.add_parser("ingest", help="Ingest a PDF into memory")
     p_ing.add_argument("file", help="Path to PDF file")
@@ -252,6 +265,16 @@ def main():
                        help="Docname for all stored chunks (default: filename)")
     p_ing.add_argument("--batch-pages", type=int, default=0, metavar="N",
                        help="Split PDF into N-page batches for parallel OCR (requires pypdf)")
+    p_ing.add_argument("--start-chunk", type=int, default=1, metavar="N",
+                       help="Skip first N-1 chunks and start storing from chunk N (1-indexed)")
+    p_ing.add_argument("--resume", action="store_true",
+                       help="Auto-detect existing chunks for the docname and continue from the next one")
+    p_ing.add_argument("--no-embed", action="store_true",
+                       help="Skip computing embeddings for chunks (faster, no vector search)")
+
+    p_emb = sub.add_parser("embed-chunks", help="(Re)compute embeddings for all existing chunks")
+    p_emb.add_argument("--workers", type=int, default=5, metavar="N",
+                        help="Parallel workers (default: 5)")
 
     p_for = sub.add_parser("forget", help="Forget a document or a single chunk")
     p_for.add_argument("--doc", default=None, metavar="NAME",
@@ -276,6 +299,7 @@ def main():
         "remember": cmd_remember,
         "recall": cmd_recall,
         "ingest": cmd_ingest,
+        "embed-chunks": cmd_embed_chunks,
         "docs": cmd_docs,
         "forget": cmd_forget,
         "memory": cmd_memory_show,
