@@ -1,6 +1,6 @@
 # mragent
 
-A lightweight, multi-role LLM agent with a persistent graph-based memory system. Designed for CLI-first workflows where you want an AI that can remember, retrieve, and reason over accumulated knowledge — without a database, vector store, or heavyweight framework.
+A lightweight, multi-role LLM agent with a persistent graph-based memory system and hybrid retrieval (FTS5 BM25 + embeddings + rerank). Designed for CLI-first workflows where you want an AI that can remember, retrieve, and reason over accumulated knowledge — everything lives in a single SQLite file plus an optional FAISS index, no heavyweight framework.
 
 ---
 
@@ -8,7 +8,7 @@ A lightweight, multi-role LLM agent with a persistent graph-based memory system.
 
 Most LLM tools treat every session as stateless. You repeat context, re-explain background, or paste in documents every time. mragent fixes this by giving the agent a persistent, structured memory it can write to and read from across sessions.
 
-The core insight: memory doesn't need semantic embeddings to be useful. A simple graph of **cues** (specific keywords), **tags** (broad topics), and **content** (the actual text) — traversed either locally or by the LLM itself — recovers the right information fast, with zero vector infrastructure.
+The backbone is a graph of **cues** (specific keywords), **tags** (broad topics), and **content** (the actual text) — traversed either locally or by the LLM itself. On top of that, recall is hybrid: FTS5 BM25 keyword search and embedding similarity run in parallel, are fused with reciprocal rank fusion, and optionally re-ranked with Cohere Rerank. Each layer degrades gracefully — no FAISS installed means brute-force cosine, no embeddings means BM25 only, no FTS5 means an in-memory BM25 with Snowball stemming and diacritic folding.
 
 ---
 
@@ -16,13 +16,17 @@ The core insight: memory doesn't need semantic embeddings to be useful. A simple
 
 ```
 main.py          — CLI entry point, command dispatch
-llmwrapper.py    — thin HTTP wrapper over OpenRouter (no SDK dependency)
+llmwrapper.py    — thin HTTP wrapper over OpenRouter (no SDK dependency):
+                   chat, tools, embeddings, Cohere rerank, OCR
 agent/
-  agent.py       — MemoryAgent: store, recall (fast + deep), PDF ingest
+  agent.py       — MemoryAgent: store, recall (fast + deep), PDF ingest, RRF fusion
 memory/
-  graph.py       — Cue-Tag-Content graph, JSON persistence, ranking
+  graph.py       — Cue-Tag-Content graph on SQLite: FTS5 BM25, FAISS vector
+                   search (optional), in-memory BM25 fallback, query expansion
   controller.py  — LLM tool schemas (search_memory, get_by_tag, …)
-memory.json      — persisted graph (auto-created on first write)
+memory.db        — SQLite database: nodes, edges, embeddings, FTS5 index
+                   (auto-created on first write)
+memory.faiss     — persisted FAISS index (auto-rebuilt from memory.db)
 ```
 
 ### The Cue-Tag-Content Graph
@@ -40,7 +44,7 @@ cue:"GIL"     ──►  tag:"concurrency"  ──►  content:"The Global …"
 
 This two-level indirection lets the system answer both narrow queries ("find everything about GIL") and broad queries ("what do I know about concurrency?") without embedding arithmetic.
 
-Nodes are deduplicated: storing two items with the same tag reuses the existing tag node and fans out its edges. The graph is persisted as a single `memory.json` after every write, protected by a threading lock for concurrent ingestion.
+Nodes are deduplicated: storing two items with the same tag reuses the existing tag node and fans out its edges. The graph lives in a single SQLite database (`memory.db`, WAL mode) committed per-write, protected by a threading lock for concurrent ingestion. A legacy `memory.json` is migrated automatically on first run.
 
 ---
 
@@ -94,14 +98,15 @@ python main.py memory
 
 ## Recall Modes
 
-### Fast recall (default)
+### Fast recall (default) — hybrid pipeline
 
-1. Tokenise the query into terms.
-2. Score every content node by term-frequency overlap (pure Python, no LLM).
-3. Take top-N (default 8) by score.
-4. Feed those chunks to the LLM in a single call: "Answer using only this context."
+1. **Query expansion** — related cues found in the graph are appended to the query.
+2. **Dual retrieval** — FTS5 BM25 keyword search and FAISS embedding similarity run on the same budget (2× top-N candidates each).
+3. **Reciprocal rank fusion** — the two ranked lists are merged (`k=60`); chunks found by both retrievers float to the top.
+4. **Rerank** (optional, on by default) — Cohere Rerank trims the fused candidates to top-N (default 32) by relevance.
+5. **Synthesis** — one LLM call: "Answer using only this context."
 
-**Cost:** 1 LLM call, sub-second graph traversal. Best for focused queries.
+**Cost:** 1 embedding call + 1 rerank call + 1 LLM call. Falls back to BM25-only if embeddings fail. Best for focused queries.
 
 ### Deep recall (`--deep`)
 
@@ -127,11 +132,12 @@ Split on blank lines → merge paragraphs up to chunk_size (default 800 chars)
   │
   ▼
 ThreadPoolExecutor (default 5 workers)
-  │  ├─ chunk 1 → LLM: extract cues+tags → store in graph
-  │  ├─ chunk 2 → LLM: extract cues+tags → store in graph
+  │  ├─ chunk 1 → LLM: extract cues+tags → embed → store in graph
+  │  ├─ chunk 2 → LLM: extract cues+tags → embed → store in graph
   │  └─ ...
   ▼
-memory.json updated after each chunk
+memory.db + FTS5 + FAISS updated after each chunk
+(interrupted? --resume continues from the last stored chunk)
 ```
 
 OCR engines available:
@@ -147,13 +153,13 @@ OCR engines available:
 
 ## Optimisations
 
-### No SDK, no embedding model
+### No SDK, no local embedding model
 
-`llmwrapper.py` uses only `urllib.request` from the standard library. Zero third-party HTTP dependencies. The only runtime dependency is `python-dotenv`. This keeps cold-start time under 100 ms and the install footprint minimal.
+`llmwrapper.py` uses only `urllib.request` from the standard library — zero third-party HTTP dependencies. Embeddings and reranking go through the OpenRouter API, so no local model weights are downloaded. Core runtime dependencies are just `python-dotenv` and `snowballstemmer`; `faiss-cpu`/`numpy` are an optional extra (brute-force cosine fallback without them). This keeps cold-start time low and the install footprint minimal.
 
 ### Local ranking before LLM
 
-Fast recall scores content nodes with a term-frequency loop in pure Python. The LLM only sees the top-ranked chunks, not the entire memory. For a 1000-chunk graph, this reduces context sent to the LLM by 99% while keeping recall quality high for specific queries.
+Fast recall ranks content nodes locally — FTS5 BM25 (persisted index, no per-query tokenization) fused with FAISS vector search. The LLM only sees the top-ranked chunks, not the entire memory. For a 1000-chunk graph, this reduces context sent to the LLM by 99% while keeping recall quality high for specific queries.
 
 ### Parallel tool execution in deep recall
 
@@ -185,12 +191,12 @@ The cue and tag index is injected into the system prompt before the first deep-r
 |---|---|---|
 | **Primary input** | Arbitrary text, files, PDFs | Structured wiki / article content |
 | **Memory model** | Graph (Cue → Tag → Content) | Flat or document-centric index |
-| **Retrieval** | Term-frequency ranking + LLM-guided graph traversal | Keyword / semantic search over articles |
+| **Retrieval** | Hybrid BM25 + embeddings + RRF + rerank, or LLM-guided graph traversal | Keyword / semantic search over articles |
 | **Agent loop** | Agentic tool use (search_memory, get_by_tag) with step cap | Direct retrieval, no multi-step agent loop |
 | **Write path** | LLM extracts metadata on ingest | Metadata comes from document structure |
 | **PDF support** | Yes — OCR + chunking pipeline | No |
-| **Persistence** | Single `memory.json`, schema-free | Depends on wiki source |
-| **Dependencies** | `python-dotenv` only | Varies |
+| **Persistence** | Single SQLite `memory.db` (+ optional FAISS index) | Depends on wiki source |
+| **Dependencies** | `python-dotenv`, `snowballstemmer` (FAISS optional) | Varies |
 | **Best for** | Personal knowledge accumulation over time | Querying a fixed knowledge corpus |
 
 In short: **mragent** is a general-purpose memory layer you write to incrementally; **llmwiki** is a read-optimized interface over a pre-existing structured corpus.
@@ -203,9 +209,12 @@ In short: **mragent** is a general-purpose memory layer you write to incremental
 
 ```bash
 # Install dependencies
-pip install python-dotenv
+pip install python-dotenv snowballstemmer
 # or with Poetry
 poetry install
+
+# Optional: FAISS vector search (otherwise brute-force cosine fallback)
+pip install faiss-cpu numpy          # or: poetry install --extras vector
 
 # Set your API key
 echo "OPENROUTER_APIKEY=sk-or-..." > .env
@@ -213,6 +222,8 @@ echo "OPENROUTER_APIKEY=sk-or-..." > .env
 # Optional: Mistral OCR 4 direct (higher quality PDF extraction)
 echo "MISTRAL_API_KEY=..." >> .env
 ```
+
+The repository ships no pre-built memory: `memory.db`, the FAISS index, and source PDFs are gitignored. Build your own memory with `remember` / `ingest` — the FTS5 and FAISS indexes are created and maintained automatically.
 
 The default model is `deepseek/deepseek-v4-flash` via OpenRouter. Override per-run with `--model`:
 

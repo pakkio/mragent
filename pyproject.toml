@@ -11,6 +11,12 @@ dependencies = [
     "snowballstemmer (>=3.1.0,<4.0.0)"
 ]
 
+[project.optional-dependencies]
+# FAISS vector search — memory/graph.py degrades gracefully to brute-force cosine without it
+vector = ["faiss-cpu (>=1.9.0,<2.0.0)", "numpy (>=2.0,<3.0)"]
+# --batch-pages parallel PDF OCR
+pdf = ["pypdf (>=5.0,<7.0)"]
+
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
