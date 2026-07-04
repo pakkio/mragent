@@ -5,6 +5,7 @@ import json
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -234,14 +235,16 @@ class LLMWrapper:
         """Return a single embedding vector via text-embedding-3-small."""
         return self.embed_batch([text])[0]
 
-    def embed_batch(self, texts: list[str], batch_size: int = 50) -> list[list[float]]:
-        """Return embedding vectors for *texts*, batching to respect API limits."""
-        all_vectors: list[list[float]] = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
+    def embed_batch(self, texts: list[str], batch_size: int = 50, workers: int = 1) -> list[list[float]]:
+        """Return embedding vectors for *texts*, batching to respect API limits.
+        When *workers* > 1, independent batches are requested concurrently."""
+        batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
+        n_batches = len(batches)
+
+        def fetch(indexed_batch: tuple[int, list[str]]) -> tuple[int, list[list[float]]]:
+            i, batch = indexed_batch
             t0 = time.time()
-            print(f"[embed] batch {i // batch_size + 1}/{(len(texts) + batch_size - 1) // batch_size} "
-                  f"({len(batch)} texts)...", flush=True)
+            print(f"[embed] batch {i + 1}/{n_batches} ({len(batch)} texts)...", flush=True)
             payload = {
                 "model": EMBED_MODEL,
                 "input": batch,
@@ -264,7 +267,21 @@ class LLMWrapper:
                         raise RuntimeError(f"Embedding failed after 3 retries: {e}") from e
                     time.sleep(2 ** attempt)
             vectors = [item["embedding"] for item in data["data"]]
-            all_vectors.extend(vectors)
             elapsed = time.time() - t0
-            print(f"[embed]   done in {elapsed:.1f}s ({len(batch)} vectors)", flush=True)
+            print(f"[embed]   batch {i + 1}/{n_batches} done in {elapsed:.1f}s ({len(batch)} vectors)", flush=True)
+            return i, vectors
+
+        results: dict[int, list[list[float]]] = {}
+        if workers > 1 and n_batches > 1:
+            with ThreadPoolExecutor(max_workers=min(workers, n_batches)) as pool:
+                for i, vectors in pool.map(fetch, enumerate(batches)):
+                    results[i] = vectors
+        else:
+            for i, batch in enumerate(batches):
+                _, vectors = fetch((i, batch))
+                results[i] = vectors
+
+        all_vectors: list[list[float]] = []
+        for i in range(n_batches):
+            all_vectors.extend(results[i])
         return all_vectors

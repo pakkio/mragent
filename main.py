@@ -134,6 +134,7 @@ def cmd_ingest(llm: LLMWrapper, args) -> None:
         start_chunk=args.start_chunk,
         resume=args.resume,
         embed=not args.no_embed,
+        extract_batch_size=args.extract_batch_size,
     )
     alias = args.alias or args.file
     print(f"[ingest] done — {count} chunk(s) stored as '{alias}'")
@@ -259,8 +260,8 @@ def main():
     )
     p_ing.add_argument("--chunk-size", type=int, default=_load_config().get("chunk_size", 800), metavar="N",
                        help="Max chars per memory chunk (default: 800)")
-    p_ing.add_argument("--workers", type=int, default=_load_config().get("workers", 5), metavar="N",
-                       help="Parallel LLM workers for cue/tag extraction (default: 5)")
+    p_ing.add_argument("--workers", type=int, default=_load_config().get("workers", 16), metavar="N",
+                       help="Parallel LLM workers for cue/tag extraction and embedding (default: 16)")
     p_ing.add_argument("--alias", default=None, metavar="NAME",
                        help="Docname for all stored chunks (default: filename)")
     p_ing.add_argument("--batch-pages", type=int, default=0, metavar="N",
@@ -271,10 +272,12 @@ def main():
                        help="Auto-detect existing chunks for the docname and continue from the next one")
     p_ing.add_argument("--no-embed", action="store_true",
                        help="Skip computing embeddings for chunks (faster, no vector search)")
+    p_ing.add_argument("--extract-batch-size", type=int, default=8, metavar="N",
+                       help="Chunks per cue/tag extraction LLM call (default: 8)")
 
     p_emb = sub.add_parser("embed-chunks", help="(Re)compute embeddings for all existing chunks")
-    p_emb.add_argument("--workers", type=int, default=5, metavar="N",
-                        help="Parallel workers (default: 5)")
+    p_emb.add_argument("--workers", type=int, default=16, metavar="N",
+                        help="Parallel workers (default: 16)")
 
     p_for = sub.add_parser("forget", help="Forget a document or a single chunk")
     p_for.add_argument("--doc", default=None, metavar="NAME",

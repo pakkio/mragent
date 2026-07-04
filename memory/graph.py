@@ -35,6 +35,10 @@ CREATE INDEX IF NOT EXISTS idx_nodes_type     ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_docname  ON nodes(docname);
 CREATE INDEX IF NOT EXISTS idx_edges_source   ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target   ON edges(target_id);
+
+-- Case-insensitive lookup for _find_or_create (cue/tag dedup on every insert).
+-- COLLATE NOCASE lets `text = ?` use this index instead of scanning with LOWER(text)=LOWER(?).
+CREATE INDEX IF NOT EXISTS idx_nodes_type_text_nocase ON nodes(type, text COLLATE NOCASE);
 """
 
 # SQLite FTS5 for ranked full-text search on *content* nodes.
@@ -56,6 +60,9 @@ class MemoryGraph:
         db_exists = os.path.exists(path)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # NORMAL is safe under WAL (only a crash+power-loss can lose the last
+        # commit, not corrupt the db) and skips an fsync on every commit.
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
         self._conn.executescript(_FTS_SCHEMA)
@@ -128,12 +135,14 @@ class MemoryGraph:
                     # cue → tag
                     self._add_edge(c, cue_id, tid)
 
-            self._conn.commit()
+            # Populate content_fts in the same transaction/commit as the node+edge
+            # inserts above. The virtual doc is exactly content + these cues/tags —
+            # the content node is brand new, so no other edges can reference it yet,
+            # meaning we don't need to re-query cues/tags via edges (see _fts_virtual_doc).
+            fts_doc = " ".join([content, *cues, *tags])
+            c.execute("INSERT INTO content_fts(rowid, text) VALUES (?, ?)", (cid, fts_doc))
 
-        # NB: outside the lock — _fts_upsert re-acquires self._lock and
-        # threading.Lock is not reentrant (deadlock otherwise).
-        # populate content_fts for BM25 retrieval
-        self._fts_upsert(cid)
+            self._conn.commit()
 
         # add to FAISS index if embedding was provided
         if embedding is not None:
@@ -513,7 +522,7 @@ class MemoryGraph:
         Cue and tag nodes are shared across documents — no docname is set.
         """
         row = cursor.execute(
-            "SELECT id FROM nodes WHERE type = ? AND LOWER(text) = LOWER(?)",
+            "SELECT id FROM nodes WHERE type = ? AND text = ? COLLATE NOCASE",
             (ntype, text),
         ).fetchone()
         if row:

@@ -24,6 +24,13 @@ Extract structured metadata from text. Respond ONLY with valid JSON, no markdown
 Format: {"cues": ["keyword1", ...], "tags": ["topic1", ...]}
 cues: 3-6 specific keywords/entities. tags: 2-3 broad topic categories."""
 
+_EXTRACT_BATCH_SYSTEM = """\
+Extract structured metadata for each numbered text below. Respond ONLY with a valid \
+JSON array, no markdown, no extra keys. Each array element corresponds by position \
+to a text: {"cues": ["keyword1", ...], "tags": ["topic1", ...]}
+cues: 3-6 specific keywords/entities. tags: 2-3 broad topic categories.
+Return exactly one JSON object per numbered text, in order, as a JSON array."""
+
 
 def _rrf(ranked_a: list[str], ranked_b: list[str], k: int = 60) -> list[str]:
     """Reciprocal Rank Fusion: merge two ranked lists into one."""
@@ -61,22 +68,47 @@ class MemoryAgent:
         print(f"[memory] stored {cid}{label}{emb_status} | cues={cues} | tags={tags}")
         return cid
 
-    def store_auto(self, content: str, docname: str | None = None, embed: bool = True) -> str:
-        """Use LLM to extract cues/tags, then store.
-        Falls back to first-4-words heuristic if the LLM call or JSON parse fails."""
+    def _extract_metadata(self, content: str) -> tuple[list[str], list[str]]:
+        """Single-chunk cue/tag extraction. Falls back to first-4-words heuristic."""
         try:
             raw = self.llm.call(Prompt(
                 user=f"Text to index:\n\n{content}",
                 system=_EXTRACT_SYSTEM,
             ))
             meta = json.loads(raw.strip().lstrip("```json").rstrip("```").strip())
-            cues = meta.get("cues", [])
-            tags = meta.get("tags", [])
+            return meta.get("cues", []), meta.get("tags", [])
         except Exception as e:
             print(f"[memory] LLM extraction failed: {e} — using fallback cues", flush=True)
             words = content.split()
-            cues = words[:4]
-            tags = ["general"]
+            return words[:4], ["general"]
+
+    def _extract_metadata_batch(self, chunks: list[str]) -> list[tuple[list[str], list[str]]]:
+        """Extract cues/tags for several chunks in a single LLM call.
+        Falls back to per-chunk extraction if the batched call or JSON parse fails."""
+        if len(chunks) == 1:
+            return [self._extract_metadata(chunks[0])]
+
+        numbered = "\n\n".join(f"[{i + 1}]\n{c}" for i, c in enumerate(chunks))
+        try:
+            raw = self.llm.call(Prompt(
+                user=f"Texts to index:\n\n{numbered}",
+                system=_EXTRACT_BATCH_SYSTEM,
+            ))
+            items = json.loads(raw.strip().lstrip("```json").rstrip("```").strip())
+            if not isinstance(items, list) or len(items) != len(chunks):
+                raise ValueError(
+                    f"expected {len(chunks)} items, got "
+                    f"{len(items) if isinstance(items, list) else type(items).__name__}"
+                )
+            return [(it.get("cues", []), it.get("tags", [])) for it in items]
+        except Exception as e:
+            print(f"[memory] batch extraction failed: {e} — falling back to per-chunk extraction", flush=True)
+            return [self._extract_metadata(c) for c in chunks]
+
+    def store_auto(self, content: str, docname: str | None = None, embed: bool = True) -> str:
+        """Use LLM to extract cues/tags, then store.
+        Falls back to first-4-words heuristic if the LLM call or JSON parse fails."""
+        cues, tags = self._extract_metadata(content)
         return self.store(content, cues, tags, docname=docname, embed=embed)
 
     def embed_existing(self, workers: int = 5) -> int:
@@ -105,7 +137,7 @@ class MemoryAgent:
         if not texts:
             return 0
 
-        vectors = self.llm.embed_batch(texts)
+        vectors = self.llm.embed_batch(texts, workers=workers)
 
         # Store
         count = 0
@@ -135,6 +167,7 @@ class MemoryAgent:
         start_chunk: int = 1,
         resume: bool = False,
         embed: bool = True,
+        extract_batch_size: int = 8,
     ) -> int:
         """Extract text from a PDF, chunk it, and store each chunk in memory.
 
@@ -150,6 +183,10 @@ class MemoryAgent:
 
         *resume*: auto-detect how many chunks already exist for *docname* and
         continue from the next one. Overrides *start_chunk* if chunks are found.
+
+        Cue/tag extraction is batched *extract_batch_size* chunks per LLM call
+        (fewer round-trips); embeddings are computed afterwards in one batched
+        pass over all newly-stored chunks (fewer, larger embedding requests).
         """
         docname = alias or os.path.splitext(os.path.basename(path))[0]
 
@@ -198,21 +235,36 @@ class MemoryAgent:
         chunks = chunks[start_chunk - 1:]
 
         print(f"[ingest] {total} total chunk(s) from {os.path.basename(path)} -> '{docname}'; "
-              f"storing {len(chunks)} chunk(s) (chunk {start_chunk}–{total}) — {workers} workers")
+              f"storing {len(chunks)} chunk(s) (chunk {start_chunk}–{total}) — {workers} workers, "
+              f"extraction batched {extract_batch_size}/call")
+
+        # group consecutive chunks so cue/tag extraction costs one LLM call per group
+        numbered_chunks = list(enumerate(chunks, start_chunk))
+        groups = [
+            numbered_chunks[i:i + extract_batch_size]
+            for i in range(0, len(numbered_chunks), extract_batch_size)
+        ]
 
         done = [0]
 
-        def process(item):
-            i, chunk = item
-            self.store_auto(chunk, docname=docname, embed=embed)
-            done[0] += 1
-            label = f"  [{start_chunk + done[0] - 1}/{total}]" if start_chunk > 1 else f"  [{done[0]}/{total}]"
-            print(f"{label} {chunk[:70].replace(chr(10), ' ')}...")
+        def process_group(group):
+            texts = [c for _, c in group]
+            metas = self._extract_metadata_batch(texts)
+            for (idx, chunk), (cues, tags) in zip(group, metas):
+                # embedding deferred to a single batched pass after all chunks are stored
+                self.store(chunk, cues, tags, docname=docname, embed=False)
+                done[0] += 1
+                label = f"  [{idx}/{total}]" if start_chunk > 1 else f"  [{done[0]}/{total}]"
+                print(f"{label} {chunk[:70].replace(chr(10), ' ')}...")
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(process, (i, c)) for i, c in enumerate(chunks, start_chunk)]
+            futures = [pool.submit(process_group, g) for g in groups]
             for f in as_completed(futures):
                 f.result()  # re-raise any exception
+
+        if embed:
+            print(f"[ingest] computing embeddings for {len(chunks)} chunk(s) in batches...", flush=True)
+            self.embed_existing(workers=workers)
 
         return len(chunks)
 
