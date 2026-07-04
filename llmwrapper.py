@@ -54,6 +54,9 @@ class LLMWrapper:
         self.api_key = api_key or os.environ.get("OPENROUTER_APIKEY")
         if not self.api_key:
             raise ValueError("OPENROUTER_APIKEY not set in environment or .env")
+        # Running total across every call this instance makes — callers snapshot
+        # it before/after an operation to get that operation's cost by delta.
+        self.total_cost = 0.0
 
     def _request(self, payload: dict, timeout: int = 120, max_retries: int = 3) -> dict:
         model = payload.get("model", "?")
@@ -77,10 +80,18 @@ class LLMWrapper:
                     print(f"[openrouter] <- headers received ({time.time()-t0:.1f}s), reading body...", flush=True)
                     data = json.loads(resp.read())
                     elapsed = time.time() - t0
-                    self.last_model = data.get("model", "unknown")
-                    usage = data.get("usage", {})
-                    print(f"[openrouter] done in {elapsed:.1f}s | model={self.last_model} | tokens={usage}", flush=True)
-                    return data
+                    if "choices" not in data:
+                        # OpenRouter can return HTTP 200 with a malformed/error body
+                        # (e.g. moderation, upstream hiccup) — treat as retryable.
+                        last_error = RuntimeError(
+                            f"OpenRouter response missing 'choices' after {elapsed:.1f}s: {data}"
+                        )
+                    else:
+                        self.last_model = data.get("model", "unknown")
+                        usage = data.get("usage", {})
+                        self.total_cost += usage.get("cost", 0.0) or 0.0
+                        print(f"[openrouter] done in {elapsed:.1f}s | model={self.last_model} | tokens={usage}", flush=True)
+                        return data
             except TimeoutError:
                 last_error = RuntimeError(
                     f"OpenRouter timed out after {timeout}s — try --engine mistral-ocr-4 or split the PDF"
@@ -226,6 +237,7 @@ class LLMWrapper:
         ordered = [documents[r["index"]] for r in sorted(results, key=lambda r: r.get("relevance_score", 0), reverse=True)]
         elapsed = time.time() - t0
         label = model.split("/")[-1] if "/" in model else model
+        self.total_cost += data.get("usage", {}).get("cost", 0.0) or 0.0
         print(f"[rerank] {len(documents)} → {len(ordered)} docs in {elapsed:.1f}s ({label})", flush=True)
         return ordered
 
@@ -267,6 +279,7 @@ class LLMWrapper:
                         raise RuntimeError(f"Embedding failed after 3 retries: {e}") from e
                     time.sleep(2 ** attempt)
             vectors = [item["embedding"] for item in data["data"]]
+            self.total_cost += data.get("usage", {}).get("cost", 0.0) or 0.0
             elapsed = time.time() - t0
             print(f"[embed]   batch {i + 1}/{n_batches} done in {elapsed:.1f}s ({len(batch)} vectors)", flush=True)
             return i, vectors

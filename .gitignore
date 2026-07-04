@@ -10,3 +10,4 @@ memory.db*
 dist/
 .venv/
 *.txt
+.ocr_cache/

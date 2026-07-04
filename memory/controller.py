@@ -50,19 +50,33 @@ TOOLS = [
 ]
 
 
-def dispatch(graph: MemoryGraph, name: str, args: dict) -> str:
+def dispatch(graph: MemoryGraph, name: str, args: dict, registry: dict | None = None) -> str:
+    """Run a tool call against the graph.
+
+    *registry* (optional), if given, is a shared ``{full_content_text: citation_number}``
+    dict — each distinct content chunk returned gets assigned a stable [N] the
+    first time it's seen, prefixed to the result line, so the LLM can cite it
+    inline instead of quoting it verbatim.
+    """
+    def _cite(text: str) -> str:
+        if registry is None:
+            return ""
+        if text not in registry:
+            registry[text] = len(registry) + 1
+        return f"[{registry[text]}] "
+
     if name == "search_memory":
         results = graph.search_cue(args.get("cue", ""))
         if not results:
             return f"No memories found for cue: {args.get('cue')}"
-        lines = [f"[{r['cue']} → {r['tag']}] {r['content'][:600]}" for r in results[:4]]
+        lines = [f"{_cite(r['content'])}({r['cue']} → {r['tag']}) {r['content'][:600]}" for r in results[:4]]
         return "\n".join(lines)
 
     if name == "get_by_tag":
         results = graph.get_by_tag(args.get("tag", ""))
         if not results:
             return f"No memories found for tag: {args.get('tag')}"
-        lines = [f"[{r['tag']}] {r['content'][:600]}" for r in results[:4]]
+        lines = [f"{_cite(r['content'])}({r['tag']}) {r['content'][:600]}" for r in results[:4]]
         return "\n".join(lines)
 
     if name == "list_cues":

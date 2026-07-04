@@ -485,6 +485,15 @@ class MemoryGraph:
             ).fetchone()
             return row[0] if row else 0
 
+    def docname_for_text(self, text: str) -> Optional[str]:
+        """Look up the docname of a content node by its exact text (for reference footers)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT docname FROM nodes WHERE type = 'content' AND text = ? LIMIT 1",
+                (text,),
+            ).fetchone()
+            return row[0] if row else None
+
     def list_docs(self) -> list[dict]:
         """Return document summaries: docname → chunk count, total chars."""
         with self._lock:

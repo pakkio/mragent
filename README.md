@@ -27,6 +27,9 @@ memory/
 memory.db        — SQLite database: nodes, edges, embeddings, FTS5 index
                    (auto-created on first write)
 memory.faiss     — persisted FAISS index (auto-rebuilt from memory.db)
+.ocr_cache/      — per-batch OCR text checkpoints, keyed by docname
+                   (gitignored; lets an interrupted --batch-pages ingest
+                   resume without re-paying for already-OCR'd pages)
 ```
 
 ### The Cue-Tag-Content Graph
@@ -98,24 +101,50 @@ python main.py memory
 
 ## Recall Modes
 
+Both modes return the same output shape: the answer framed between full terminal-width
+`=` borders, followed by a **Riferimenti** footer and a **Costi** breakdown — both built
+in Python from data already in hand, so they cost zero extra LLM output tokens.
+
+```
+====================================================================
+<answer, citing sources inline as [3], [7], ...>
+====================================================================
+
+Riferimenti:
+[3] (docname) preview of the chunk text...
+[7] (docname) preview of the chunk text...
+
+Costi:
+  embedding : $0.00000
+  rerank    : $0.00100
+  sintesi   : $0.00138
+  totale    : $0.00238
+```
+
+Every chunk sent to the LLM is numbered `[N]` in the prompt, and the system prompt
+instructs the model to **cite the number inline instead of quoting the chunk
+verbatim** — this cuts duplicated source text out of the answer and shrinks output
+tokens. The Riferimenti footer only lists numbers the model actually cited; a
+retrieved-but-ignored chunk gets no entry.
+
 ### Fast recall (default) — hybrid pipeline
 
 1. **Query expansion** — related cues found in the graph are appended to the query.
 2. **Dual retrieval** — FTS5 BM25 keyword search and FAISS embedding similarity run on the same budget (2× top-N candidates each).
 3. **Reciprocal rank fusion** — the two ranked lists are merged (`k=60`); chunks found by both retrievers float to the top.
 4. **Rerank** (optional, on by default) — Cohere Rerank trims the fused candidates to top-N (default 32) by relevance.
-5. **Synthesis** — one LLM call: "Answer using only this context."
+5. **Synthesis** — one LLM call, citing chunks as `[N]`.
 
-**Cost:** 1 embedding call + 1 rerank call + 1 LLM call. Falls back to BM25-only if embeddings fail. Best for focused queries.
+**Cost breakdown:** `embedding` + `rerank` + `sintesi` (synthesis), each tracked individually. Falls back to BM25-only if embeddings fail. Best for focused queries.
 
 ### Deep recall (`--deep`)
 
 1. Inject the full cue and tag index into the system prompt so the LLM knows what's available.
-2. The LLM calls tools (`search_memory`, `get_by_tag`) in parallel — multiple graph lookups in one round-trip via `ThreadPoolExecutor`.
-3. Tool results are appended to the message history and the LLM synthesizes a final answer.
+2. The LLM calls tools (`search_memory`, `get_by_tag`) in parallel — multiple graph lookups in one round-trip via `ThreadPoolExecutor`. Each distinct chunk a tool returns is assigned a stable `[N]` the first time it's seen (shared registry across all steps).
+3. Tool results are appended to the message history and the LLM synthesizes a final answer, citing `[N]`.
 4. Capped at `max_steps=3` to bound cost; a forced-answer turn fires if the cap is reached.
 
-**Cost:** 2–4 LLM calls. Better for open-ended or multi-faceted queries.
+**Cost breakdown:** one entry per step — `ricerca in memoria (step N)` while the LLM is still searching, `risposta finale` (or `risposta finale (max passi raggiunti)` if the step cap forced it) for the synthesis call. Better for open-ended or multi-faceted queries.
 
 ---
 
@@ -126,19 +155,38 @@ PDF file
   │
   ▼
 OCR (OpenRouter file-parser plugin or Mistral OCR 4 direct)
+  │  --batch-pages N splits the PDF into N-page batches, OCR'd in parallel;
+  │  each batch's extracted text is checkpointed to .ocr_cache/<docname>/ as
+  │  soon as it completes, so a crashed/interrupted run resumes for free —
+  │  only the batches that never finished get (re)sent to the OCR engine.
+  ▼
+Split on blank lines → merge paragraphs up to chunk_size (default 1500 chars)
   │
   ▼
-Split on blank lines → merge paragraphs up to chunk_size (default 800 chars)
+ThreadPoolExecutor (default 16 workers)
+  │  ├─ group of extract-batch-size chunks (default 8) → ONE LLM call
+  │  │  extracts cues+tags for all of them at once (falls back to
+  │  │  per-chunk extraction if the batched JSON parse fails)
+  │  └─ ... stored in the graph with embed=False (deferred)
+  ▼
+Single batched, parallelized embedding pass over every newly-stored chunk
+(embed_batch, 50 texts/request, workers concurrent requests)
   │
   ▼
-ThreadPoolExecutor (default 5 workers)
-  │  ├─ chunk 1 → LLM: extract cues+tags → embed → store in graph
-  │  ├─ chunk 2 → LLM: extract cues+tags → embed → store in graph
-  │  └─ ...
-  ▼
-memory.db + FTS5 + FAISS updated after each chunk
-(interrupted? --resume continues from the last stored chunk)
+memory.db + FTS5 + FAISS updated
+(interrupted before this point? --resume continues from the last stored chunk;
+ OCR itself resumes from .ocr_cache/ regardless)
 ```
+
+Cue/tag extraction and embeddings used to cost one HTTP round-trip *per chunk*;
+batching both cuts the number of LLM/embedding requests by roughly
+`extract_batch_size` and `50×` respectively, which is most of what makes ingest
+fast — see [Optimisations](#optimisations) below.
+
+OpenRouter occasionally returns HTTP 200 with a malformed body (moderation,
+upstream hiccup) instead of raising a clean error — `LLMWrapper._request`
+detects a missing `choices` key and retries it like a 5xx, instead of crashing
+the whole ingest on a bare `KeyError`.
 
 OCR engines available:
 
@@ -167,7 +215,34 @@ When the LLM emits multiple tool calls in one step, mragent runs all of them in 
 
 ### Parallel PDF chunking
 
-PDF ingestion dispatches all chunk-processing tasks (OCR text → cue/tag extraction → graph write) to a thread pool. On a 50-page document split into 30 chunks with 5 workers, wall-clock time is ~6× faster than sequential processing.
+PDF ingestion dispatches all chunk-processing tasks (OCR text → cue/tag extraction → graph write) to a thread pool of `--workers` (default 16) threads.
+
+### Batched cue/tag extraction and embeddings
+
+The two most expensive per-chunk steps used to each cost one HTTP round-trip
+per chunk. Both are now batched:
+
+- **Cue/tag extraction** bundles `--extract-batch-size` (default 8) chunks into
+  a single LLM call asking for a JSON array of `{cues, tags}`, one per chunk,
+  in order — falling back to per-chunk extraction if the batched call or JSON
+  parse fails.
+- **Embeddings** are deferred during the per-chunk store loop (`embed=False`)
+  and computed afterwards in one pass over every new chunk, via
+  `embed_batch(..., workers=N)`, which both batches requests (50 texts each)
+  and fires them concurrently instead of one request per chunk.
+
+Together these cut the number of network round-trips for a 1000-chunk ingest
+from ~2000 (1 extraction + 1 embedding call per chunk) to roughly
+125 extraction calls + 20 embedding calls.
+
+### Checkpointed OCR batches
+
+`--batch-pages` splits a PDF into page-range batches OCR'd in parallel; each
+batch's extracted text is written to `.ocr_cache/<docname>/` as soon as it
+completes. If the process crashes or a batch fails (OpenRouter timeout,
+malformed response after retries exhausted), re-running the same `ingest`
+command loads every already-OCR'd batch straight from disk — no OCR cost is
+paid twice — and only retries the batches that never finished.
 
 ### Graph deduplication
 
@@ -216,6 +291,9 @@ poetry install
 # Optional: FAISS vector search (otherwise brute-force cosine fallback)
 pip install faiss-cpu numpy          # or: poetry install --extras vector
 
+# Optional: parallel PDF batching for ingest (--batch-pages)
+pip install pypdf                    # or: poetry install --extras pdf
+
 # Set your API key
 echo "OPENROUTER_APIKEY=sk-or-..." > .env
 
@@ -243,9 +321,14 @@ python main.py --model anthropic/claude-sonnet-4-6 ask "Explain monads."
 | Flag | Default | Description |
 |---|---|---|
 | `--model` | `deepseek/deepseek-v4-flash` | Any OpenRouter model slug |
-| `--chunk-size` | `800` | Max chars per PDF chunk |
-| `--workers` | `5` | Parallel workers for PDF ingestion |
+| `--chunk-size` | `1500` | Max chars per PDF chunk |
+| `--workers` | `16` | Parallel workers for cue/tag extraction, embedding, and OCR batches |
+| `--extract-batch-size` | `8` | Chunks bundled into one cue/tag-extraction LLM call |
+| `--batch-pages` | `0` (off) | Split PDF into N-page batches, OCR'd in parallel and checkpointed to `.ocr_cache/` |
+| `--no-embed` | off | Skip embedding computation during ingest |
+| `--resume` | off | Auto-detect existing chunks for the docname and continue from the next one |
 | `--deep` | off | Enable iterative graph traversal on recall |
+| `--no-rerank` | off | Skip the Cohere rerank step on fast recall |
 
 ---
 

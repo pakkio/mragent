@@ -17,6 +17,9 @@ STRICT RULES — follow exactly:
   2. Step 1: call search_memory and get_by_tag in parallel (4-6 calls at once).
   3. Step 2: answer directly from what you retrieved. Do NOT search again.
   4. Maximum 2 steps total: one search step, then the answer.
+Each memory item returned by a tool is prefixed with a citation number like [N] —
+cite that number inline in your answer (e.g. [3]) instead of quoting the item's
+text verbatim, to avoid duplicating content in your answer.
 Only answer from what memory contains — say so if memory has nothing relevant."""
 
 _EXTRACT_SYSTEM = """\
@@ -208,7 +211,7 @@ class MemoryAgent:
                 text = f.read()
             print(f"[ingest] read {len(text)} chars directly from {os.path.basename(path)}")
         elif batch_pages > 0 and engine != "mistral-ocr-4":
-            text = self._ingest_batched(path, engine, batch_pages, workers)
+            text = self._ingest_batched(path, engine, batch_pages, workers, docname)
         elif engine == "mistral-ocr-4":
             text = self.llm.extract_pdf_mistral_ocr4(path)
         else:
@@ -271,9 +274,16 @@ class MemoryAgent:
     # ── batched PDF ingestion ────────────────────────────────────────────────
 
     def _ingest_batched(
-        self, path: str, engine: str, batch_pages: int, workers: int,
+        self, path: str, engine: str, batch_pages: int, workers: int, docname: str,
     ) -> str:
-        """Split PDF into page batches, OCR each in parallel, return merged text."""
+        """Split PDF into page batches, OCR each in parallel, return merged text.
+
+        Each batch's extracted text is checkpointed to disk under
+        ``.ocr_cache/<docname>/`` right after it's OCR'd. A batch whose
+        checkpoint already exists is loaded from disk instead of re-sent to
+        the OCR engine — so a crashed or interrupted run can be re-launched
+        and only the batches that never completed get (re)charged/redone.
+        """
         import tempfile
 
         try:
@@ -283,42 +293,58 @@ class MemoryAgent:
                 "--batch-pages requires pypdf. Install it: pip install pypdf"
             )
 
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(self.graph.path)) or ".", ".ocr_cache", docname)
+        os.makedirs(cache_dir, exist_ok=True)
+
         reader = PdfReader(path)
         total = len(reader.pages)
-        batches: list[tuple[int, int, str]] = []  # (start, end, temp_path)
+        batches: list[tuple[int, int, str, str]] = []  # (start, end, temp_path, cache_path)
 
         tmpdir = tempfile.mkdtemp(prefix="mragent_pdf_")
         try:
-            # split into page-range batches
+            # split into page-range batches; skip writing sub-PDFs for already-cached batches
             for start in range(0, total, batch_pages):
                 end = min(start + batch_pages, total)
-                writer = PdfWriter()
-                for i in range(start, end):
-                    writer.add_page(reader.pages[i])
+                cache_path = os.path.join(cache_dir, f"batch_{start:04d}_{end:04d}.txt")
                 tmp_path = os.path.join(tmpdir, f"batch_{start:04d}_{end:04d}.pdf")
-                with open(tmp_path, "wb") as f:
-                    writer.write(f)
-                batches.append((start + 1, end, tmp_path))
+                if not os.path.exists(cache_path):
+                    writer = PdfWriter()
+                    for i in range(start, end):
+                        writer.add_page(reader.pages[i])
+                    with open(tmp_path, "wb") as f:
+                        writer.write(f)
+                batches.append((start + 1, end, tmp_path, cache_path))
 
+            n_cached = sum(1 for *_, cp in batches if os.path.exists(cp))
+            n_pending = len(batches) - n_cached
             print(f"[ingest] {total} page(s) split into {len(batches)} batch(es) "
-                  f"({batch_pages} pages each) — {min(workers, len(batches))} parallel OCR workers")
+                  f"({batch_pages} pages each) — {n_cached} cached, {n_pending} to OCR "
+                  f"({min(workers, n_pending) if n_pending else 0} parallel OCR workers)")
 
-            # OCR each batch in parallel
+            # OCR each pending batch in parallel; cached ones load instantly
             results: dict[int, str] = {}
 
             def ocr_batch(item):
-                idx, (pg_start, pg_end, tmp_path) = item
+                idx, (pg_start, pg_end, tmp_path, cache_path) = item
+                if os.path.exists(cache_path):
+                    with open(cache_path, encoding="utf-8") as f:
+                        txt = f.read()
+                    print(f"  [batch {idx}/{len(batches)}] pages {pg_start}-{pg_end} "
+                          f"cached ({len(txt)} chars)", flush=True)
+                    return idx, txt
                 t0 = time.time()
                 size_kb = os.path.getsize(tmp_path) / 1024
                 print(f"  [batch {idx}/{len(batches)}] pages {pg_start}-{pg_end} "
                       f"({size_kb:.0f} KB) OCR...", flush=True)
                 txt = self.llm.extract_pdf_openrouter(tmp_path, engine=engine)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    f.write(txt)
                 elapsed = time.time() - t0
                 print(f"  [batch {idx}/{len(batches)}] pages {pg_start}-{pg_end} "
                       f"done in {elapsed:.1f}s ({len(txt)} chars)", flush=True)
                 return idx, txt
 
-            with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
                     pool.submit(ocr_batch, (i, b))
                     for i, b in enumerate(batches, 1)
@@ -340,6 +366,7 @@ class MemoryAgent:
     def recall_fast(self, query: str, top_n: int = 32, rerank: bool = True) -> str:
         """Hybrid: query expansion → BM25 + embedding → reciprocal rank fusion → LLM re-rank → synthesize."""
         t0 = time.time()
+        costs = {"embedding": 0.0, "rerank": 0.0, "sintesi": 0.0}
 
         # Step 1 — query expansion via graph cues
         expanded = self.graph.expand_query(query)
@@ -352,7 +379,9 @@ class MemoryAgent:
 
         embed_chunks: list[str] = []
         try:
+            cost_before = self.llm.total_cost
             q_vec = self.llm.embed_text(query)
+            costs["embedding"] = self.llm.total_cost - cost_before
             embed_chunks = self.graph.rank_by_embedding(q_vec, top_n=fetch_n)
             print(f"  [fast] BM25={len(bm25_chunks)} + embed={len(embed_chunks)} chunks", flush=True)
         except Exception as e:
@@ -371,22 +400,81 @@ class MemoryAgent:
         # Step 4 — LLM re-ranking (optional)
         if rerank and len(chunks) > top_n:
             print(f"  [fast] re-ranking {len(chunks)} → {top_n} chunks via LLM...", flush=True)
+            cost_before = self.llm.total_cost
             chunks = self._rerank(query, chunks, top_k=top_n)
+            costs["rerank"] = self.llm.total_cost - cost_before
             print(f"  [fast] re-ranked to {len(chunks)} chunks", flush=True)
 
-        # Step 5 — synthesize answer
-        context = "\n\n---\n\n".join(chunks)
+        # Step 5 — synthesize answer. Chunks are numbered [N] so the LLM can cite
+        # them inline instead of quoting them verbatim (saves output tokens and
+        # avoids duplicating the source text). The "Riferimenti" footer is built
+        # afterwards from this same numbered list — not by the LLM — so it costs
+        # no extra output tokens.
+        context = "\n\n---\n\n".join(f"[{i + 1}] {c}" for i, c in enumerate(chunks))
         print(f"  [fast] {len(chunks)} chunk(s), calling LLM...", flush=True)
+        cost_before = self.llm.total_cost
         answer = self.llm.call(Prompt(
             user=f"Question: {query}\n\nRelevant memory:\n\n{context}",
             system=(
-                "Answer the question using ONLY the provided memory. "
-                "Be thorough and well-structured. When the memory contains equations, "
-                "include them explicitly — do not just describe them."
+                "Answer the question using ONLY the provided memory. Be thorough and "
+                "well-structured. Each memory item below is numbered like [N] — cite "
+                "the relevant number(s) inline (e.g. [3]) instead of quoting the "
+                "item's text verbatim, to avoid duplicating content in your answer."
             ),
         ))
-        print(f"  [fast] done in {time.time() - t0:.1f}s total", flush=True)
-        return answer
+        costs["sintesi"] = self.llm.total_cost - cost_before
+        print(f"  [fast] done in {time.time() - t0:.1f}s total | cost ${sum(costs.values()):.5f}", flush=True)
+        return self._finalize_answer(answer, chunks, costs)
+
+    def _finalize_answer(self, answer: str, chunks: list[str], costs: dict[str, float]) -> str:
+        """Frame the answer and append Riferimenti/Costi — shared by fast and deep recall."""
+        return (
+            self._frame(answer)
+            + self._references_footer(answer, chunks)
+            + self._costs_footer(costs)
+        )
+
+    @staticmethod
+    def _frame(text: str) -> str:
+        """Wrap *text* in a full terminal-width '=' border for readability."""
+        import shutil
+        width = shutil.get_terminal_size(fallback=(80, 24)).columns
+        bar = "=" * width
+        return f"{bar}\n{text}\n{bar}"
+
+    @staticmethod
+    def _costs_footer(costs: dict[str, float]) -> str:
+        """Per-category cost breakdown, appended outside the answer frame."""
+        label_width = max(len(label) for label in [*costs, "totale"])
+        lines = ["\n\nCosti:"]
+        for label, value in costs.items():
+            lines.append(f"  {label:<{label_width}} : ${value:.5f}")
+        lines.append(f"  {'totale':<{label_width}} : ${sum(costs.values()):.5f}")
+        return "\n".join(lines)
+
+    def _references_footer(self, answer: str, chunks: list[str], preview_len: int = 100) -> str:
+        """Build the 'Riferimenti' footer, but only for chunks the LLM actually
+        cited as [N] in its answer — a retrieved-but-ignored chunk gets no entry.
+        Built entirely from data already in hand (no extra LLM call/output tokens)."""
+        import re
+        # Matches [3], [5,6], [5, 6, 7] — the model sometimes groups several
+        # citations inside one bracket instead of writing [5][6][7].
+        cited = sorted({
+            n
+            for group in re.findall(r"\[(\d+(?:\s*,\s*\d+)*)\]", answer)
+            for n in (int(x) for x in group.split(","))
+            if 1 <= n <= len(chunks)
+        })
+        if not cited:
+            return ""
+        lines = ["\n\nRiferimenti:"]
+        for i in cited:
+            chunk = chunks[i - 1]
+            docname = self.graph.docname_for_text(chunk) or "?"
+            preview = chunk[:preview_len].replace("\n", " ").strip()
+            ellipsis = "..." if len(chunk) > preview_len else ""
+            lines.append(f"[{i}] ({docname}) {preview}{ellipsis}")
+        return "\n".join(lines)
 
     def _rerank(self, query: str, chunks: list[str], top_k: int,
                  model: str = RERANK_3_MODEL) -> list[str]:
@@ -410,18 +498,28 @@ class MemoryAgent:
             {"role": "user", "content": query},
         ]
         t0 = time.time()
+        costs: dict[str, float] = {}
+        # shared {chunk_text: citation_number} registry, filled in by dispatch()
+        # as tool results come back, so every distinct chunk gets a stable [N]
+        chunk_registry: dict[str, int] = {}
 
         for step in range(self.max_steps):
             print(f"  [step {step + 1}] thinking...", flush=True)
             t_step = time.time()
+            cost_before = self.llm.total_cost
             msg = self.llm.call_with_tools(messages, TOOLS)
+            step_cost = self.llm.total_cost - cost_before
             print(f"  [step {step + 1}] response in {time.time() - t_step:.1f}s", flush=True)
             messages.append(msg)
 
             tool_calls = msg.get("tool_calls")
             if not tool_calls:
-                print(f"  [recall] done in {time.time() - t0:.1f}s total", flush=True)
-                return msg.get("content") or ""
+                # the LLM answered directly instead of requesting more searches
+                costs["risposta finale"] = costs.get("risposta finale", 0.0) + step_cost
+                print(f"  [recall] done in {time.time() - t0:.1f}s total | cost ${sum(costs.values()):.5f}", flush=True)
+                return self._finalize_deep_answer(msg.get("content") or "", chunk_registry, costs)
+
+            costs[f"ricerca in memoria (step {step + 1})"] = step_cost
 
             def _run_tool(tc):
                 fn = tc["function"]
@@ -430,7 +528,7 @@ class MemoryAgent:
                 except json.JSONDecodeError:
                     args = {}
                 print(f"  [step {step + 1}] {fn['name']}({args})")
-                result = dispatch(self.graph, fn["name"], args)
+                result = dispatch(self.graph, fn["name"], args, registry=chunk_registry)
                 return tc["id"], result
 
             with ThreadPoolExecutor(max_workers=len(tool_calls)) as pool:
@@ -446,6 +544,18 @@ class MemoryAgent:
         # max steps reached — force final answer
         print(f"  [max steps] forcing answer...", flush=True)
         messages.append({"role": "user", "content": "Synthesize a final answer from what you found."})
+        cost_before = self.llm.total_cost
         msg = self.llm.call_with_tools(messages, [])
-        print(f"  [recall] done in {time.time() - t0:.1f}s total", flush=True)
-        return msg.get("content") or ""
+        costs["risposta finale (max passi raggiunti)"] = self.llm.total_cost - cost_before
+        print(f"  [recall] done in {time.time() - t0:.1f}s total | cost ${sum(costs.values()):.5f}", flush=True)
+        return self._finalize_deep_answer(msg.get("content") or "", chunk_registry, costs)
+
+    def _finalize_deep_answer(
+        self, answer: str, chunk_registry: dict[str, int], costs: dict[str, float],
+    ) -> str:
+        """Turn the {text: N} citation registry into an ordered chunk list, then
+        delegate to the same framing/footer logic used by recall_fast."""
+        ordered_chunks: list[str] = [""] * len(chunk_registry)
+        for text, num in chunk_registry.items():
+            ordered_chunks[num - 1] = text
+        return self._finalize_answer(answer, ordered_chunks, costs)
