@@ -1,6 +1,6 @@
 # mragent
 
-A lightweight, multi-role LLM agent with a persistent graph-based memory system. Designed for CLI-first workflows where you want an AI that can remember, retrieve, and reason over accumulated knowledge — without a database, vector store, or heavyweight framework.
+A lightweight, multi-role LLM agent with a persistent graph-based memory system and hybrid retrieval (FTS5 BM25 + embeddings + rerank). Designed for CLI-first workflows where you want an AI that can remember, retrieve, and reason over accumulated knowledge — everything lives in a single SQLite file plus an optional FAISS index, no heavyweight framework.
 
 ---
 
@@ -8,7 +8,7 @@ A lightweight, multi-role LLM agent with a persistent graph-based memory system.
 
 Most LLM tools treat every session as stateless. You repeat context, re-explain background, or paste in documents every time. mragent fixes this by giving the agent a persistent, structured memory it can write to and read from across sessions.
 
-The core insight: memory doesn't need semantic embeddings to be useful. A simple graph of **cues** (specific keywords), **tags** (broad topics), and **content** (the actual text) — traversed either locally or by the LLM itself — recovers the right information fast, with zero vector infrastructure.
+The backbone is a graph of **cues** (specific keywords), **tags** (broad topics), and **content** (the actual text) — traversed either locally or by the LLM itself. On top of that, recall is hybrid: FTS5 BM25 keyword search and embedding similarity run in parallel, are fused with reciprocal rank fusion, and optionally re-ranked with Cohere Rerank. Each layer degrades gracefully — no FAISS installed means brute-force cosine, no embeddings means BM25 only, no FTS5 means an in-memory BM25 with Snowball stemming and diacritic folding.
 
 ---
 
@@ -16,13 +16,20 @@ The core insight: memory doesn't need semantic embeddings to be useful. A simple
 
 ```
 main.py          — CLI entry point, command dispatch
-llmwrapper.py    — thin HTTP wrapper over OpenRouter (no SDK dependency)
+llmwrapper.py    — thin HTTP wrapper over OpenRouter (no SDK dependency):
+                   chat, tools, embeddings, Cohere rerank, OCR
 agent/
-  agent.py       — MemoryAgent: store, recall (fast + deep), PDF ingest
+  agent.py       — MemoryAgent: store, recall (fast + deep), PDF ingest, RRF fusion
 memory/
-  graph.py       — Cue-Tag-Content graph, JSON persistence, ranking
+  graph.py       — Cue-Tag-Content graph on SQLite: FTS5 BM25, FAISS vector
+                   search (optional), in-memory BM25 fallback, query expansion
   controller.py  — LLM tool schemas (search_memory, get_by_tag, …)
-memory.json      — persisted graph (auto-created on first write)
+memory.db        — SQLite database: nodes, edges, embeddings, FTS5 index
+                   (auto-created on first write)
+memory.faiss     — persisted FAISS index (auto-rebuilt from memory.db)
+.ocr_cache/      — per-batch OCR text checkpoints, keyed by docname
+                   (gitignored; lets an interrupted --batch-pages ingest
+                   resume without re-paying for already-OCR'd pages)
 ```
 
 ### The Cue-Tag-Content Graph
@@ -40,7 +47,7 @@ cue:"GIL"     ──►  tag:"concurrency"  ──►  content:"The Global …"
 
 This two-level indirection lets the system answer both narrow queries ("find everything about GIL") and broad queries ("what do I know about concurrency?") without embedding arithmetic.
 
-Nodes are deduplicated: storing two items with the same tag reuses the existing tag node and fans out its edges. The graph is persisted as a single `memory.json` after every write, protected by a threading lock for concurrent ingestion.
+Nodes are deduplicated: storing two items with the same tag reuses the existing tag node and fans out its edges. The graph lives in a single SQLite database (`memory.db`, WAL mode) committed per-write, protected by a threading lock for concurrent ingestion. A legacy `memory.json` is migrated automatically on first run.
 
 ---
 
@@ -94,23 +101,50 @@ python main.py memory
 
 ## Recall Modes
 
-### Fast recall (default)
+Both modes return the same output shape: the answer framed between full terminal-width
+`=` borders, followed by a **Riferimenti** footer and a **Costi** breakdown — both built
+in Python from data already in hand, so they cost zero extra LLM output tokens.
 
-1. Tokenise the query into terms.
-2. Score every content node by term-frequency overlap (pure Python, no LLM).
-3. Take top-N (default 8) by score.
-4. Feed those chunks to the LLM in a single call: "Answer using only this context."
+```
+====================================================================
+<answer, citing sources inline as [3], [7], ...>
+====================================================================
 
-**Cost:** 1 LLM call, sub-second graph traversal. Best for focused queries.
+Riferimenti:
+[3] (docname) preview of the chunk text...
+[7] (docname) preview of the chunk text...
+
+Costi:
+  embedding : $0.00000
+  rerank    : $0.00100
+  sintesi   : $0.00138
+  totale    : $0.00238
+```
+
+Every chunk sent to the LLM is numbered `[N]` in the prompt, and the system prompt
+instructs the model to **cite the number inline instead of quoting the chunk
+verbatim** — this cuts duplicated source text out of the answer and shrinks output
+tokens. The Riferimenti footer only lists numbers the model actually cited; a
+retrieved-but-ignored chunk gets no entry.
+
+### Fast recall (default) — hybrid pipeline
+
+1. **Query expansion** — related cues found in the graph are appended to the query.
+2. **Dual retrieval** — FTS5 BM25 keyword search and FAISS embedding similarity run on the same budget (2× top-N candidates each).
+3. **Reciprocal rank fusion** — the two ranked lists are merged (`k=60`); chunks found by both retrievers float to the top.
+4. **Rerank** (optional, on by default) — Cohere Rerank trims the fused candidates to top-N (default 32) by relevance.
+5. **Synthesis** — one LLM call, citing chunks as `[N]`.
+
+**Cost breakdown:** `embedding` + `rerank` + `sintesi` (synthesis), each tracked individually. Falls back to BM25-only if embeddings fail. Best for focused queries.
 
 ### Deep recall (`--deep`)
 
 1. Inject the full cue and tag index into the system prompt so the LLM knows what's available.
-2. The LLM calls tools (`search_memory`, `get_by_tag`) in parallel — multiple graph lookups in one round-trip via `ThreadPoolExecutor`.
-3. Tool results are appended to the message history and the LLM synthesizes a final answer.
+2. The LLM calls tools (`search_memory`, `get_by_tag`) in parallel — multiple graph lookups in one round-trip via `ThreadPoolExecutor`. Each distinct chunk a tool returns is assigned a stable `[N]` the first time it's seen (shared registry across all steps).
+3. Tool results are appended to the message history and the LLM synthesizes a final answer, citing `[N]`.
 4. Capped at `max_steps=3` to bound cost; a forced-answer turn fires if the cap is reached.
 
-**Cost:** 2–4 LLM calls. Better for open-ended or multi-faceted queries.
+**Cost breakdown:** one entry per step — `ricerca in memoria (step N)` while the LLM is still searching, `risposta finale` (or `risposta finale (max passi raggiunti)` if the step cap forced it) for the synthesis call. Better for open-ended or multi-faceted queries.
 
 ---
 
@@ -121,18 +155,38 @@ PDF file
   │
   ▼
 OCR (OpenRouter file-parser plugin or Mistral OCR 4 direct)
+  │  --batch-pages N splits the PDF into N-page batches, OCR'd in parallel;
+  │  each batch's extracted text is checkpointed to .ocr_cache/<docname>/ as
+  │  soon as it completes, so a crashed/interrupted run resumes for free —
+  │  only the batches that never finished get (re)sent to the OCR engine.
+  ▼
+Split on blank lines → merge paragraphs up to chunk_size (default 1500 chars)
   │
   ▼
-Split on blank lines → merge paragraphs up to chunk_size (default 800 chars)
+ThreadPoolExecutor (default 16 workers)
+  │  ├─ group of extract-batch-size chunks (default 8) → ONE LLM call
+  │  │  extracts cues+tags for all of them at once (falls back to
+  │  │  per-chunk extraction if the batched JSON parse fails)
+  │  └─ ... stored in the graph with embed=False (deferred)
+  ▼
+Single batched, parallelized embedding pass over every newly-stored chunk
+(embed_batch, 50 texts/request, workers concurrent requests)
   │
   ▼
-ThreadPoolExecutor (default 5 workers)
-  │  ├─ chunk 1 → LLM: extract cues+tags → store in graph
-  │  ├─ chunk 2 → LLM: extract cues+tags → store in graph
-  │  └─ ...
-  ▼
-memory.json updated after each chunk
+memory.db + FTS5 + FAISS updated
+(interrupted before this point? --resume continues from the last stored chunk;
+ OCR itself resumes from .ocr_cache/ regardless)
 ```
+
+Cue/tag extraction and embeddings used to cost one HTTP round-trip *per chunk*;
+batching both cuts the number of LLM/embedding requests by roughly
+`extract_batch_size` and `50×` respectively, which is most of what makes ingest
+fast — see [Optimisations](#optimisations) below.
+
+OpenRouter occasionally returns HTTP 200 with a malformed body (moderation,
+upstream hiccup) instead of raising a clean error — `LLMWrapper._request`
+detects a missing `choices` key and retries it like a 5xx, instead of crashing
+the whole ingest on a bare `KeyError`.
 
 OCR engines available:
 
@@ -147,13 +201,13 @@ OCR engines available:
 
 ## Optimisations
 
-### No SDK, no embedding model
+### No SDK, no local embedding model
 
-`llmwrapper.py` uses only `urllib.request` from the standard library. Zero third-party HTTP dependencies. The only runtime dependency is `python-dotenv`. This keeps cold-start time under 100 ms and the install footprint minimal.
+`llmwrapper.py` uses only `urllib.request` from the standard library — zero third-party HTTP dependencies. Embeddings and reranking go through the OpenRouter API, so no local model weights are downloaded. Core runtime dependencies are just `python-dotenv` and `snowballstemmer`; `faiss-cpu`/`numpy` are an optional extra (brute-force cosine fallback without them). This keeps cold-start time low and the install footprint minimal.
 
 ### Local ranking before LLM
 
-Fast recall scores content nodes with a term-frequency loop in pure Python. The LLM only sees the top-ranked chunks, not the entire memory. For a 1000-chunk graph, this reduces context sent to the LLM by 99% while keeping recall quality high for specific queries.
+Fast recall ranks content nodes locally — FTS5 BM25 (persisted index, no per-query tokenization) fused with FAISS vector search. The LLM only sees the top-ranked chunks, not the entire memory. For a 1000-chunk graph, this reduces context sent to the LLM by 99% while keeping recall quality high for specific queries.
 
 ### Parallel tool execution in deep recall
 
@@ -161,7 +215,34 @@ When the LLM emits multiple tool calls in one step, mragent runs all of them in 
 
 ### Parallel PDF chunking
 
-PDF ingestion dispatches all chunk-processing tasks (OCR text → cue/tag extraction → graph write) to a thread pool. On a 50-page document split into 30 chunks with 5 workers, wall-clock time is ~6× faster than sequential processing.
+PDF ingestion dispatches all chunk-processing tasks (OCR text → cue/tag extraction → graph write) to a thread pool of `--workers` (default 16) threads.
+
+### Batched cue/tag extraction and embeddings
+
+The two most expensive per-chunk steps used to each cost one HTTP round-trip
+per chunk. Both are now batched:
+
+- **Cue/tag extraction** bundles `--extract-batch-size` (default 8) chunks into
+  a single LLM call asking for a JSON array of `{cues, tags}`, one per chunk,
+  in order — falling back to per-chunk extraction if the batched call or JSON
+  parse fails.
+- **Embeddings** are deferred during the per-chunk store loop (`embed=False`)
+  and computed afterwards in one pass over every new chunk, via
+  `embed_batch(..., workers=N)`, which both batches requests (50 texts each)
+  and fires them concurrently instead of one request per chunk.
+
+Together these cut the number of network round-trips for a 1000-chunk ingest
+from ~2000 (1 extraction + 1 embedding call per chunk) to roughly
+125 extraction calls + 20 embedding calls.
+
+### Checkpointed OCR batches
+
+`--batch-pages` splits a PDF into page-range batches OCR'd in parallel; each
+batch's extracted text is written to `.ocr_cache/<docname>/` as soon as it
+completes. If the process crashes or a batch fails (OpenRouter timeout,
+malformed response after retries exhausted), re-running the same `ingest`
+command loads every already-OCR'd batch straight from disk — no OCR cost is
+paid twice — and only retries the batches that never finished.
 
 ### Graph deduplication
 
@@ -185,12 +266,12 @@ The cue and tag index is injected into the system prompt before the first deep-r
 |---|---|---|
 | **Primary input** | Arbitrary text, files, PDFs | Structured wiki / article content |
 | **Memory model** | Graph (Cue → Tag → Content) | Flat or document-centric index |
-| **Retrieval** | Term-frequency ranking + LLM-guided graph traversal | Keyword / semantic search over articles |
+| **Retrieval** | Hybrid BM25 + embeddings + RRF + rerank, or LLM-guided graph traversal | Keyword / semantic search over articles |
 | **Agent loop** | Agentic tool use (search_memory, get_by_tag) with step cap | Direct retrieval, no multi-step agent loop |
 | **Write path** | LLM extracts metadata on ingest | Metadata comes from document structure |
 | **PDF support** | Yes — OCR + chunking pipeline | No |
-| **Persistence** | Single `memory.json`, schema-free | Depends on wiki source |
-| **Dependencies** | `python-dotenv` only | Varies |
+| **Persistence** | Single SQLite `memory.db` (+ optional FAISS index) | Depends on wiki source |
+| **Dependencies** | `python-dotenv`, `snowballstemmer` (FAISS optional) | Varies |
 | **Best for** | Personal knowledge accumulation over time | Querying a fixed knowledge corpus |
 
 In short: **mragent** is a general-purpose memory layer you write to incrementally; **llmwiki** is a read-optimized interface over a pre-existing structured corpus.
@@ -203,9 +284,15 @@ In short: **mragent** is a general-purpose memory layer you write to incremental
 
 ```bash
 # Install dependencies
-pip install python-dotenv
+pip install python-dotenv snowballstemmer
 # or with Poetry
 poetry install
+
+# Optional: FAISS vector search (otherwise brute-force cosine fallback)
+pip install faiss-cpu numpy          # or: poetry install --extras vector
+
+# Optional: parallel PDF batching for ingest (--batch-pages)
+pip install pypdf                    # or: poetry install --extras pdf
 
 # Set your API key
 echo "OPENROUTER_APIKEY=sk-or-..." > .env
@@ -213,6 +300,8 @@ echo "OPENROUTER_APIKEY=sk-or-..." > .env
 # Optional: Mistral OCR 4 direct (higher quality PDF extraction)
 echo "MISTRAL_API_KEY=..." >> .env
 ```
+
+The repository ships no pre-built memory: `memory.db`, the FAISS index, and source PDFs are gitignored. Build your own memory with `remember` / `ingest` — the FTS5 and FAISS indexes are created and maintained automatically.
 
 The default model is `deepseek/deepseek-v4-flash` via OpenRouter. Override per-run with `--model`:
 
@@ -232,9 +321,14 @@ python main.py --model anthropic/claude-sonnet-4-6 ask "Explain monads."
 | Flag | Default | Description |
 |---|---|---|
 | `--model` | `deepseek/deepseek-v4-flash` | Any OpenRouter model slug |
-| `--chunk-size` | `800` | Max chars per PDF chunk |
-| `--workers` | `5` | Parallel workers for PDF ingestion |
+| `--chunk-size` | `1500` | Max chars per PDF chunk |
+| `--workers` | `16` | Parallel workers for cue/tag extraction, embedding, and OCR batches |
+| `--extract-batch-size` | `8` | Chunks bundled into one cue/tag-extraction LLM call |
+| `--batch-pages` | `0` (off) | Split PDF into N-page batches, OCR'd in parallel and checkpointed to `.ocr_cache/` |
+| `--no-embed` | off | Skip embedding computation during ingest |
+| `--resume` | off | Auto-detect existing chunks for the docname and continue from the next one |
 | `--deep` | off | Enable iterative graph traversal on recall |
+| `--no-rerank` | off | Skip the Cohere rerank step on fast recall |
 
 ---
 

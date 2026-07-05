@@ -2,7 +2,12 @@ __pycache__/
 *.pyc
 .env
 memory.json
-memory.db
+memory.db*
+*.faiss
+*.faiss.ids.npy
+*.pdf
 *.egg-info/
 dist/
 .venv/
+*.txt
+.ocr_cache/
