@@ -360,3 +360,9 @@ python main.py recall --deep "What are the computational trade-offs of self-atte
 pytest                    # unit tests only
 pytest -m live            # includes live API calls (requires OPENROUTER_APIKEY)
 ```
+
+---
+
+## Documents and copyright
+
+This repository does not ship third-party documents. Put the PDFs you want to work with in the project folder yourself: `*.pdf` is in `.gitignore`, so they stay local and are never committed.
